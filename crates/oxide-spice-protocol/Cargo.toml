@@ -1,0 +1,12 @@
+[package]
+name = "oxide-spice-protocol"
+description = "Checked SPICE wire protocol types, parsers, and encoders"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true

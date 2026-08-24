@@ -1,0 +1,23 @@
+[package]
+name = "oxide-spice-codecs"
+description = "Bounded image and audio codecs used by OxideSpice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+miniz_oxide.workspace = true
+jpeg-decoder.workspace = true
+lz4_flex.workspace = true
+openh264.workspace = true
+opus.workspace = true
+rust_h265.workspace = true
+thiserror.workspace = true
+vpx-rs.workspace = true
+zune-jpeg.workspace = true
+
+[dev-dependencies]
+jpeg-encoder = { version = "0.7.1", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

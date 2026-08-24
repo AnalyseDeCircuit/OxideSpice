@@ -1,0 +1,35 @@
+[package]
+name = "oxide-spice-client"
+description = "Asynchronous pure-Rust SPICE client sessions and channels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+tls-ring = ["dep:tokio-rustls"]
+
+[dependencies]
+bytemuck.workspace = true
+oxide-spice-codecs.workspace = true
+oxide-spice-protocol.workspace = true
+pixman.workspace = true
+rsa.workspace = true
+rustix.workspace = true
+rsasl.workspace = true
+sha1.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls = { workspace = true, optional = true }
+zeroize.workspace = true
+
+[dev-dependencies]
+jpeg-encoder = { version = "0.7.1", default-features = false, features = ["std"] }
+miniz_oxide.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[build-dependencies]
+pkg-config = "0.3.32"
+
+[lints]
+workspace = true
