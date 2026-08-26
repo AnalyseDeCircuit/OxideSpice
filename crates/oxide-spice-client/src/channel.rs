@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use oxide_spice_protocol::{
     AUTH_MECHANISM_SASL, AUTH_MECHANISM_SPICE, CapabilitySet, ChannelType, DataHeader, Framing,
-    LINK_HEADER_SIZE, LinkError, LinkHeader, LinkMessage, LinkReply, WaitForChannels,
-    common_capability, common_client, common_server,
+    LINK_HEADER_SIZE, LinkError, LinkHeader, LinkMessage, LinkReply, SubMessageList, SubMessages,
+    WaitForChannels, common_capability, common_client, common_server,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
@@ -189,6 +189,94 @@ pub(crate) struct IncomingMessage<'a> {
     pub body: &'a [u8],
 }
 
+/// A validated wire envelope whose sub-messages precede its optional main message.
+pub(crate) struct IncomingEnvelope<'a> {
+    header: DataHeader,
+    main_body: Option<&'a [u8]>,
+    submessages: Option<SubMessageList<'a>>,
+}
+
+impl<'a> IncomingEnvelope<'a> {
+    pub(crate) fn decode(header: DataHeader, body: &'a [u8]) -> Result<Self, ClientError> {
+        if header.message_type == common_server::LIST {
+            if header.sub_list_offset.is_some_and(|offset| offset != 0) {
+                return Err(unsupported_protocol_value("nested sub-message envelope"));
+            }
+            return Ok(Self {
+                header,
+                main_body: None,
+                submessages: Some(SubMessageList::decode(body, 0)?),
+            });
+        }
+        let Some(list_offset) = header.sub_list_offset.filter(|offset| *offset != 0) else {
+            return Ok(Self {
+                header,
+                main_body: Some(body),
+                submessages: None,
+            });
+        };
+        let main_end = usize::try_from(list_offset)
+            .map_err(|_| protocol_value_error("sub-message list offset"))?;
+        let main_body = body
+            .get(..main_end)
+            .ok_or_else(|| protocol_value_error("sub-message list offset"))?;
+        Ok(Self {
+            header,
+            main_body: Some(main_body),
+            submessages: Some(SubMessageList::decode(body, list_offset)?),
+        })
+    }
+
+    pub(crate) fn messages(&self) -> IncomingMessages<'a> {
+        IncomingMessages {
+            envelope_header: self.header,
+            submessages: self.submessages.map(|list| list.iter()),
+            main_body: self.main_body,
+        }
+    }
+
+    pub(crate) fn counts_for_ack(&self) -> bool {
+        self.header.message_type != common_server::SET_ACK
+            || self
+                .submessages
+                .is_some_and(|messages| !messages.is_empty())
+    }
+}
+
+pub(crate) struct IncomingMessages<'a> {
+    envelope_header: DataHeader,
+    submessages: Option<SubMessages<'a>>,
+    main_body: Option<&'a [u8]>,
+}
+
+impl<'a> Iterator for IncomingMessages<'a> {
+    type Item = IncomingMessage<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(submessage) = self.submessages.as_mut().and_then(Iterator::next) {
+            return Some(IncomingMessage {
+                header: DataHeader {
+                    serial: self.envelope_header.serial,
+                    message_type: submessage.message_type,
+                    body_size: u32::try_from(submessage.body.len())
+                        .expect("validated message body fits wire size"),
+                    sub_list_offset: None,
+                },
+                body: submessage.body,
+            });
+        }
+        self.submessages = None;
+        self.main_body.take().map(|body| IncomingMessage {
+            header: DataHeader {
+                body_size: u32::try_from(body.len()).expect("wire body length fits u32"),
+                sub_list_offset: None,
+                ..self.envelope_header
+            },
+            body,
+        })
+    }
+}
+
 impl<S> Channel<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -294,9 +382,6 @@ where
         self.received_serial_base
             .checked_add(self.last_received_serial)
             .ok_or_else(|| protocol_value_error("effective message serial overflow"))?;
-        if header.sub_list_offset.is_some_and(|offset| offset != 0) {
-            return Err(unsupported_protocol_value("sub-message list"));
-        }
         Ok(header)
     }
 
@@ -699,11 +784,35 @@ impl ControlState {
         self.migration_activation_count = channel.migration_activation_count();
     }
 
-    /// Handles common control traffic and reports whether the caller should dispatch the message.
-    pub(crate) async fn handle<S>(
+    #[cfg(test)]
+    async fn handle<S>(
         &mut self,
         channel: &mut Channel<S>,
         message: &IncomingMessage<'_>,
+    ) -> Result<ControlDisposition, ClientError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        self.handle_inner(channel, message, true).await
+    }
+
+    /// Handles one logical message while deferring ACK accounting to its wire envelope.
+    pub(crate) async fn handle_without_ack<S>(
+        &mut self,
+        channel: &mut Channel<S>,
+        message: &IncomingMessage<'_>,
+    ) -> Result<ControlDisposition, ClientError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        self.handle_inner(channel, message, false).await
+    }
+
+    async fn handle_inner<S>(
+        &mut self,
+        channel: &mut Channel<S>,
+        message: &IncomingMessage<'_>,
+        count_for_ack: bool,
     ) -> Result<ControlDisposition, ClientError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -755,14 +864,29 @@ impl ControlState {
             _ => ControlDisposition::Dispatch,
         };
 
-        if self.window != 0 && message.header.message_type != common_server::SET_ACK {
-            self.consumed_since_ack = self.consumed_since_ack.saturating_add(1);
-            if self.consumed_since_ack >= self.window {
-                channel.write_message(common_client::ACK, &[]).await?;
-                self.consumed_since_ack = 0;
-            }
+        if count_for_ack && message.header.message_type != common_server::SET_ACK {
+            self.acknowledge_envelope(channel).await?;
         }
         Ok(disposition)
+    }
+
+    /// Accounts for one fully processed wire envelope regardless of its logical message count.
+    pub(crate) async fn acknowledge_envelope<S>(
+        &mut self,
+        channel: &mut Channel<S>,
+    ) -> Result<(), ClientError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        if self.window == 0 {
+            return Ok(());
+        }
+        self.consumed_since_ack = self.consumed_since_ack.saturating_add(1);
+        if self.consumed_since_ack >= self.window {
+            channel.write_message(common_client::ACK, &[]).await?;
+            self.consumed_since_ack = 0;
+        }
+        Ok(())
     }
 }
 
@@ -964,6 +1088,54 @@ mod tests {
             .expect_err("serial regression must terminate the channel");
         assert_eq!(error.category(), crate::ErrorCategory::Protocol);
         server.await.expect("server task");
+    }
+
+    #[test]
+    fn full_header_envelope_orders_submessages_before_the_main_body() {
+        let mut body = vec![0xaa];
+        body.extend_from_slice(&1_u16.to_le_bytes());
+        body.extend_from_slice(&7_u32.to_le_bytes());
+        body.extend_from_slice(&55_u16.to_le_bytes());
+        body.extend_from_slice(&1_u32.to_le_bytes());
+        body.push(0xbb);
+        let envelope = IncomingEnvelope::decode(
+            DataHeader {
+                serial: Some(9),
+                message_type: 77,
+                body_size: body.len() as u32,
+                sub_list_offset: Some(1),
+            },
+            &body,
+        )
+        .expect("valid full-header envelope");
+        let messages: Vec<_> = envelope.messages().collect();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].header.message_type, 55);
+        assert_eq!(messages[0].body, [0xbb]);
+        assert_eq!(messages[1].header.message_type, 77);
+        assert_eq!(messages[1].body, [0xaa]);
+    }
+
+    #[test]
+    fn mini_header_list_has_no_synthetic_main_message() {
+        let mut body = 1_u16.to_le_bytes().to_vec();
+        body.extend_from_slice(&6_u32.to_le_bytes());
+        body.extend_from_slice(&55_u16.to_le_bytes());
+        body.extend_from_slice(&0_u32.to_le_bytes());
+        let envelope = IncomingEnvelope::decode(
+            DataHeader {
+                serial: None,
+                message_type: common_server::LIST,
+                body_size: body.len() as u32,
+                sub_list_offset: None,
+            },
+            &body,
+        )
+        .expect("valid mini-header list");
+        let messages: Vec<_> = envelope.messages().collect();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].header.message_type, 55);
+        assert!(messages[0].body.is_empty());
     }
 
     #[tokio::test]

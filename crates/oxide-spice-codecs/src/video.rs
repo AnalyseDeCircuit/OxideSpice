@@ -1,6 +1,10 @@
+#[cfg(feature = "video-h264")]
 use openh264::formats::YUVSource;
+#[cfg(feature = "video-h265")]
 use rust_h265::PixelData;
+#[cfg(feature = "video-vpx")]
 use vpx_rs::DecodedImageData;
+#[cfg(feature = "video-vpx")]
 use vpx_rs::image::{ImageFormat, UVImagePlanes};
 
 use crate::{DecodeLimits, decode_jpeg_with_cancel};
@@ -28,6 +32,8 @@ pub struct DecodedVideoFrame {
 pub enum VideoDecodeError {
     #[error("video decoder initialization failed: {0}")]
     Initialization(String),
+    #[error("video codec is not enabled in this build: {0}")]
+    Unavailable(&'static str),
     #[error("video bitstream decode failed: {0}")]
     InvalidBitstream(String),
     #[error("video pixel layout is unsupported")]
@@ -40,8 +46,11 @@ pub enum VideoDecodeError {
 
 enum DecoderBackend {
     Mjpeg,
+    #[cfg(feature = "video-vpx")]
     Vpx(vpx_rs::Decoder),
+    #[cfg(feature = "video-h264")]
     H264(openh264::decoder::Decoder),
+    #[cfg(feature = "video-h265")]
     H265(rust_h265::Decoder),
 }
 
@@ -73,6 +82,7 @@ impl SpiceVideoDecoder {
         }
         let backend = match codec {
             SpiceVideoCodec::Mjpeg => DecoderBackend::Mjpeg,
+            #[cfg(feature = "video-vpx")]
             SpiceVideoCodec::Vp8 | SpiceVideoCodec::Vp9 => {
                 let codec_id = match codec {
                     SpiceVideoCodec::Vp8 => vpx_rs::dec::CodecId::VP8,
@@ -86,11 +96,21 @@ impl SpiceVideoDecoder {
                         .map_err(|error| VideoDecodeError::Initialization(error.to_string()))?,
                 )
             }
+            #[cfg(not(feature = "video-vpx"))]
+            SpiceVideoCodec::Vp8 | SpiceVideoCodec::Vp9 => {
+                return Err(VideoDecodeError::Unavailable("VP8/VP9"));
+            }
+            #[cfg(feature = "video-h264")]
             SpiceVideoCodec::H264 => DecoderBackend::H264(
                 openh264::decoder::Decoder::new()
                     .map_err(|error| VideoDecodeError::Initialization(error.to_string()))?,
             ),
+            #[cfg(not(feature = "video-h264"))]
+            SpiceVideoCodec::H264 => return Err(VideoDecodeError::Unavailable("H.264")),
+            #[cfg(feature = "video-h265")]
             SpiceVideoCodec::H265 => DecoderBackend::H265(rust_h265::Decoder::new()),
+            #[cfg(not(feature = "video-h265"))]
+            SpiceVideoCodec::H265 => return Err(VideoDecodeError::Unavailable("H.265")),
         };
         Ok(Self { codec, backend })
     }
@@ -127,6 +147,7 @@ impl SpiceVideoDecoder {
                     rgba: jpeg.pixels,
                 })
             }
+            #[cfg(feature = "video-h264")]
             DecoderBackend::H264(decoder) => decoder
                 .decode(packet)
                 .map_err(|error| VideoDecodeError::InvalidBitstream(error.to_string()))?
@@ -142,6 +163,7 @@ impl SpiceVideoDecoder {
                     })
                 })
                 .transpose()?,
+            #[cfg(feature = "video-vpx")]
             DecoderBackend::Vpx(decoder) => {
                 let mut newest = None;
                 for decoded in decoder
@@ -155,6 +177,7 @@ impl SpiceVideoDecoder {
                 }
                 newest
             }
+            #[cfg(feature = "video-h265")]
             DecoderBackend::H265(decoder) => {
                 let mut newest = None;
                 for nal in rust_h265::parse_annex_b(packet) {
@@ -182,6 +205,7 @@ impl SpiceVideoDecoder {
     }
 }
 
+#[cfg(feature = "video-vpx")]
 fn vpx_frame_to_rgba(
     decoded: &vpx_rs::DecodedImage,
     limits: DecodeLimits,
@@ -230,6 +254,7 @@ fn vpx_frame_to_rgba(
     }
 }
 
+#[cfg(feature = "video-h265")]
 fn h265_frame_to_rgba(
     frame: rust_h265::Frame,
     limits: DecodeLimits,
@@ -266,6 +291,7 @@ fn h265_frame_to_rgba(
     })
 }
 
+#[cfg(any(feature = "video-h264", feature = "video-h265", feature = "video-vpx"))]
 fn checked_dimensions(
     width: usize,
     height: usize,
@@ -300,6 +326,7 @@ fn validate_frame_bound(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(feature = "video-vpx", feature = "video-h265"))]
 fn write_yuv420_u8(
     width: usize,
     height: usize,
@@ -331,6 +358,7 @@ fn write_yuv420_u8(
     Ok(())
 }
 
+#[cfg(feature = "video-vpx")]
 fn write_nv12_u8(
     width: usize,
     height: usize,
@@ -365,6 +393,7 @@ fn write_nv12_u8(
     Ok(())
 }
 
+#[cfg(feature = "video-h265")]
 fn write_yuv420_u16(
     width: usize,
     height: usize,
@@ -412,6 +441,7 @@ fn write_yuv420_u16(
     Ok(())
 }
 
+#[cfg(any(feature = "video-vpx", feature = "video-h265"))]
 fn write_yuv_pixel(y: u8, u: u8, v: u8, rgba: &mut [u8]) {
     let luminance = (i32::from(y) - 16).max(0);
     let blue_difference = i32::from(u) - 128;
@@ -422,6 +452,7 @@ fn write_yuv_pixel(y: u8, u: u8, v: u8, rgba: &mut [u8]) {
     rgba[3] = u8::MAX;
 }
 
+#[cfg(any(feature = "video-vpx", feature = "video-h265"))]
 fn clamp_u8(value: i32) -> u8 {
     value.clamp(0, i32::from(u8::MAX)) as u8
 }

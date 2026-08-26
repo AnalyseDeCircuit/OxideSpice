@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  workspace:
+    name: Workspace (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install --yes
+          clang cmake libkrb5-dev libpcsclite-dev libpixman-1-dev libusb-1.0-0-dev
+          libusbredirparser-dev libvpx-dev nasm pkg-config
+
+      - name: Install macOS native dependencies
+        if: runner.os == 'macOS'
+        run: brew install cmake krb5 libusb libvpx nasm pcsc-lite pixman pkg-config usbredir
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --all-features --locked
+
+      - name: Check minimal dependency build
+        run: >-
+          cargo check -p oxide-spice-codecs --no-default-features --all-targets --locked &&
+          cargo check -p oxide-spice-client --no-default-features --all-targets --locked &&
+          cargo check -p oxide-spice-helper --no-default-features --all-targets --locked
+
+      - name: Test workspace
+        run: cargo test --workspace --locked

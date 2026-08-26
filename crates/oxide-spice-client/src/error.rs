@@ -155,6 +155,7 @@ impl ClientError {
             Self::VideoDecode(VideoDecodeError::UnsupportedPixelLayout) => {
                 ErrorCategory::Unsupported
             }
+            Self::VideoDecode(VideoDecodeError::Unavailable(_)) => ErrorCategory::Unsupported,
             Self::VideoDecode(VideoDecodeError::ResourceLimit) => ErrorCategory::ResourceLimit,
             Self::VideoDecode(VideoDecodeError::Cancelled) => ErrorCategory::Cancelled,
             Self::VideoDecode(VideoDecodeError::InvalidBitstream(_)) => ErrorCategory::Protocol,

@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::ClientError;
 use crate::channel::{
-    Channel, ChannelIdentity, ControlDisposition, ControlState, IncomingMessage, ProgressRegistry,
+    Channel, ChannelIdentity, ControlDisposition, ControlState, IncomingEnvelope, ProgressRegistry,
     handle_channel_wait,
 };
 
@@ -235,7 +235,8 @@ where
             }
             incoming = channel.read_message(&mut message_body) => {
                 let header = incoming?;
-                let message = IncomingMessage { header, body: &message_body };
+                let envelope = IncomingEnvelope::decode(header, &message_body)?;
+                let counts_for_ack = envelope.counts_for_ack();
                 let serial = channel.received_serial();
                 if let Some(seamless) =
                     channel.observe_migration_activation(&mut observed_migration_activation)
@@ -252,50 +253,24 @@ where
                         channel_id,
                     });
                 }
-                if control.handle(&mut channel, &message).await? == ControlDisposition::Consumed {
-                    progress.complete(identity, serial)?;
-                    continue;
-                }
-                if handle_channel_wait(&progress, identity, serial, &mut cancel, &message).await? {
-                    progress.complete(identity, serial)?;
-                    continue;
-                }
-                match message.header.message_type {
-                    port_server::INIT => {
-                        if name.is_some() {
-                            return Err(protocol_value_error("repeated Port Init"));
-                        }
-                        let init = PortInit::decode(message.body)?;
-                        let port_name = Arc::<str>::from(init.name);
-                        opened = init.opened;
-                        name = Some(port_name.clone());
-                        paths.state.send_replace(PortState::Ready {
-                            connection_generation,
-                            channel_type,
-                            channel_id,
-                            name: port_name,
-                            opened,
-                        });
+                for message in envelope.messages() {
+                    if control.handle_without_ack(&mut channel, &message).await?
+                        == ControlDisposition::Consumed
+                    {
+                        continue;
                     }
-                    port_server::DATA | port_server::COMPRESSED_DATA => {
-                        let port_name = name.clone().ok_or_else(|| protocol_value_error("Port Data before Init"))?;
-                        let decompressed;
-                        let data = if message.header.message_type == port_server::COMPRESSED_DATA {
-                            let compressed = SpiceVmcCompressedData::decode(
-                                message.body,
-                                MAX_PORT_DATA_BYTES,
-                            )?;
-                            decompressed = decode_lz4_block_exact(
-                                compressed.compressed_bytes,
-                                compressed.uncompressed_size,
-                                MAX_PORT_DATA_BYTES,
-                            )?;
-                            decompressed.as_slice()
-                        } else {
-                            decode_port_data(message.body)?
-                        };
-                        if !opened {
-                            opened = true;
+                    if handle_channel_wait(&progress, identity, serial, &mut cancel, &message).await? {
+                        continue;
+                    }
+                    match message.header.message_type {
+                        port_server::INIT => {
+                            if name.is_some() {
+                                return Err(protocol_value_error("repeated Port Init"));
+                            }
+                            let init = PortInit::decode(message.body)?;
+                            let port_name = Arc::<str>::from(init.name);
+                            opened = init.opened;
+                            name = Some(port_name.clone());
                             paths.state.send_replace(PortState::Ready {
                                 connection_generation,
                                 channel_type,
@@ -304,44 +279,75 @@ where
                                 opened,
                             });
                         }
-                        if !paths.inbound.is_closed() {
-                            let inbound = PortInbound::Data {
-                                bytes: Arc::from(data),
-                                discontinuity,
+                        port_server::DATA | port_server::COMPRESSED_DATA => {
+                            let port_name = name.clone().ok_or_else(|| protocol_value_error("Port Data before Init"))?;
+                            let decompressed;
+                            let data = if message.header.message_type == port_server::COMPRESSED_DATA {
+                                let compressed = SpiceVmcCompressedData::decode(
+                                    message.body,
+                                    MAX_PORT_DATA_BYTES,
+                                )?;
+                                decompressed = decode_lz4_block_exact(
+                                    compressed.compressed_bytes,
+                                    compressed.uncompressed_size,
+                                    MAX_PORT_DATA_BYTES,
+                                )?;
+                                decompressed.as_slice()
+                            } else {
+                                decode_port_data(message.body)?
                             };
-                            match paths.inbound.try_send(inbound) {
-                                Ok(()) => discontinuity = false,
-                                Err(mpsc::error::TrySendError::Full(_))
-                                | Err(mpsc::error::TrySendError::Closed(_)) => discontinuity = true,
+                            if !opened {
+                                opened = true;
+                                paths.state.send_replace(PortState::Ready {
+                                    connection_generation,
+                                    channel_type,
+                                    channel_id,
+                                    name: port_name,
+                                    opened,
+                                });
                             }
-                        }
-                    }
-                    port_server::EVENT => {
-                        let port_name = name.clone().ok_or_else(|| protocol_value_error("Port Event before Init"))?;
-                        match decode_port_event(message.body)? {
-                            PortEvent::Opened => opened = true,
-                            PortEvent::Closed => opened = false,
-                            PortEvent::Break => {
-                                match paths.inbound.try_send(PortInbound::Break) {
-                                    Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        return Err(resource_limit_error("Port event queue"));
-                                    }
+                            if !paths.inbound.is_closed() {
+                                let inbound = PortInbound::Data {
+                                    bytes: Arc::from(data),
+                                    discontinuity,
+                                };
+                                match paths.inbound.try_send(inbound) {
+                                    Ok(()) => discontinuity = false,
+                                    Err(mpsc::error::TrySendError::Full(_))
+                                    | Err(mpsc::error::TrySendError::Closed(_)) => discontinuity = true,
                                 }
                             }
                         }
-                        paths.state.send_replace(PortState::Ready {
-                            connection_generation,
-                            channel_type,
-                            channel_id,
-                            name: port_name,
-                            opened,
-                        });
+                        port_server::EVENT => {
+                            let port_name = name.clone().ok_or_else(|| protocol_value_error("Port Event before Init"))?;
+                            match decode_port_event(message.body)? {
+                                PortEvent::Opened => opened = true,
+                                PortEvent::Closed => opened = false,
+                                PortEvent::Break => {
+                                    match paths.inbound.try_send(PortInbound::Break) {
+                                        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                                        Err(mpsc::error::TrySendError::Full(_)) => {
+                                            return Err(resource_limit_error("Port event queue"));
+                                        }
+                                    }
+                                }
+                            }
+                            paths.state.send_replace(PortState::Ready {
+                                connection_generation,
+                                channel_type,
+                                channel_id,
+                                name: port_name,
+                                opened,
+                            });
+                        }
+                        message_type => return Err(ClientError::UnsupportedMessage {
+                            channel: "port",
+                            message_type,
+                        }),
                     }
-                    message_type => return Err(ClientError::UnsupportedMessage {
-                        channel: "port",
-                        message_type,
-                    }),
+                }
+                if counts_for_ack {
+                    control.acknowledge_envelope(&mut channel).await?;
                 }
                 progress.complete(identity, serial)?;
             }

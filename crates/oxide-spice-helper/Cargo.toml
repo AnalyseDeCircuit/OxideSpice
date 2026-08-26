@@ -5,18 +5,42 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = [
+    "audio-opus",
+    "composite-pixman",
+    "sasl-gssapi",
+    "smartcard",
+    "tls-ring",
+    "usbredir",
+    "video-h264",
+    "video-h265",
+    "video-vpx",
+    "webdav",
+]
+audio-opus = ["oxide-spice-client/audio-opus"]
+composite-pixman = ["oxide-spice-client/composite-pixman"]
+sasl-gssapi = ["oxide-spice-client/sasl-gssapi"]
+smartcard = ["dep:pcsc"]
+tls-ring = ["oxide-spice-client/tls-ring"]
+usbredir = ["dep:usbredirhost"]
+video-h264 = ["oxide-spice-client/video-h264"]
+video-h265 = ["oxide-spice-client/video-h265"]
+video-vpx = ["oxide-spice-client/video-vpx"]
+webdav = ["dep:dav-server", "dep:hyper", "dep:hyper-util"]
+
 [dependencies]
-dav-server.workspace = true
-hyper.workspace = true
-hyper-util.workspace = true
-oxide-spice-client = { path = "../oxide-spice-client", features = ["tls-ring"] }
+dav-server = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+oxide-spice-client = { path = "../oxide-spice-client", default-features = false }
 oxide-spice-protocol = { path = "../oxide-spice-protocol" }
-pcsc.workspace = true
+pcsc = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
-usbredirhost.workspace = true
+usbredirhost = { workspace = true, optional = true }
 zeroize.workspace = true
 
 [lints]

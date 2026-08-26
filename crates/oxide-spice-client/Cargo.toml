@@ -6,14 +6,27 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = []
+default = [
+    "audio-opus",
+    "composite-pixman",
+    "sasl-gssapi",
+    "video-h264",
+    "video-h265",
+    "video-vpx",
+]
+audio-opus = ["oxide-spice-codecs/audio-opus"]
+composite-pixman = ["dep:pixman", "dep:pkg-config"]
+sasl-gssapi = ["rsasl/gssapi"]
 tls-ring = ["dep:tokio-rustls"]
+video-h264 = ["oxide-spice-codecs/video-h264"]
+video-h265 = ["oxide-spice-codecs/video-h265"]
+video-vpx = ["oxide-spice-codecs/video-vpx"]
 
 [dependencies]
 bytemuck.workspace = true
 oxide-spice-codecs.workspace = true
 oxide-spice-protocol.workspace = true
-pixman.workspace = true
+pixman = { workspace = true, optional = true }
 rsa.workspace = true
 rustix.workspace = true
 rsasl.workspace = true
@@ -29,7 +42,7 @@ miniz_oxide.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [build-dependencies]
-pkg-config = "0.3.32"
+pkg-config = { version = "0.3.32", optional = true }
 
 [lints]
 workspace = true

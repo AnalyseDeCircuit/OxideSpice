@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, Notify, mpsc, watch};
 
 use crate::ClientError;
 use crate::channel::{
-    Channel, ChannelIdentity, ControlDisposition, ControlState, IncomingMessage, ProgressRegistry,
+    Channel, ChannelIdentity, ControlDisposition, ControlState, IncomingEnvelope, ProgressRegistry,
     handle_channel_wait,
 };
 
@@ -390,7 +390,8 @@ where
             }
             incoming = channel.read_message(&mut message_body) => {
                 let header = incoming?;
-                let message = IncomingMessage { header, body: &message_body };
+                let envelope = IncomingEnvelope::decode(header, &message_body)?;
+                let counts_for_ack = envelope.counts_for_ack();
                 let serial = channel.received_serial();
                 if let Some(seamless) =
                     channel.observe_migration_activation(&mut observed_migration_activation)
@@ -401,41 +402,46 @@ where
                     *relative_motion.pending.lock().await = None;
                     modifiers.send_replace(KeyboardModifiers::default());
                 }
-                if control.handle(&mut channel, &message).await? == ControlDisposition::Consumed {
-                    progress.complete(identity, serial)?;
-                    continue;
+                for message in envelope.messages() {
+                    if control.handle_without_ack(&mut channel, &message).await?
+                        == ControlDisposition::Consumed
+                    {
+                        continue;
+                    }
+                    if handle_channel_wait(&progress, identity, serial, &mut cancel, &message).await? {
+                        continue;
+                    }
+                    match message.header.message_type {
+                        inputs_server::INIT => {
+                            if received_init {
+                                return Err(protocol_value_error("repeated Inputs Init"));
+                            }
+                            received_init = true;
+                            modifiers.send_replace(KeyboardModifiers::decode(message.body)?);
+                        }
+                        inputs_server::KEY_MODIFIERS => {
+                            if !received_init {
+                                return Err(protocol_value_error("Inputs message before Init"));
+                            }
+                            modifiers.send_replace(KeyboardModifiers::decode(message.body)?);
+                        }
+                        inputs_server::MOUSE_MOTION_ACK => {
+                            if !received_init {
+                                return Err(protocol_value_error("Inputs message before Init"));
+                            }
+                            if !message.body.is_empty() {
+                                return Err(protocol_value_error("mouse motion ACK body"));
+                            }
+                            motion_window.acknowledge_bunch()?;
+                        }
+                        message_type => return Err(ClientError::UnsupportedMessage {
+                            channel: "inputs",
+                            message_type,
+                        }),
+                    }
                 }
-                if handle_channel_wait(&progress, identity, serial, &mut cancel, &message).await? {
-                    progress.complete(identity, serial)?;
-                    continue;
-                }
-                match message.header.message_type {
-                    inputs_server::INIT => {
-                        if received_init {
-                            return Err(protocol_value_error("repeated Inputs Init"));
-                        }
-                        received_init = true;
-                        modifiers.send_replace(KeyboardModifiers::decode(message.body)?);
-                    }
-                    inputs_server::KEY_MODIFIERS => {
-                        if !received_init {
-                            return Err(protocol_value_error("Inputs message before Init"));
-                        }
-                        modifiers.send_replace(KeyboardModifiers::decode(message.body)?);
-                    }
-                    inputs_server::MOUSE_MOTION_ACK => {
-                        if !received_init {
-                            return Err(protocol_value_error("Inputs message before Init"));
-                        }
-                        if !message.body.is_empty() {
-                            return Err(protocol_value_error("mouse motion ACK body"));
-                        }
-                        motion_window.acknowledge_bunch()?;
-                    }
-                    message_type => return Err(ClientError::UnsupportedMessage {
-                        channel: "inputs",
-                        message_type,
-                    }),
+                if counts_for_ack {
+                    control.acknowledge_envelope(&mut channel).await?;
                 }
                 progress.complete(identity, serial)?;
             }

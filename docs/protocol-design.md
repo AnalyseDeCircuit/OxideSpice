@@ -67,8 +67,10 @@ control, or migration state terminate that channel with a protocol error.
   serial, while full-header serials may skip values but may never regress.
 - Disconnecting stops new work, records the remote reason, performs bounded cooperative cleanup,
   and closes the channel.
-- Full-header sub-message and protocol-address offsets are relative to the current message body.
-  They are never treated as host pointers and cannot reference another frame.
+- Full-header sub-message lists and mini-header `SPICE_MSG_LIST` envelopes are completely validated
+  before dispatch. Sub-messages run in list order before the main message, while ACK accounting and
+  cross-channel progress advance once for the containing wire envelope. All offsets remain relative
+  to the bounded current body and are never treated as host pointers.
 
 ## Capability matrix
 
@@ -94,6 +96,13 @@ make the feature supported.
 | File transfer | Agent Start/Status/Data with token flow control; clipboard file lists instead use WebDAV | Outgoing basename-only transfers are implemented with at most eight active identities, 64-KiB chunks, one fully fragmented chunk in flight per owner, terminal status tracking, and explicit cancellation. Filesystem I/O remains outside the client crate. |
 
 ### Image and stream formats
+
+The classic Canvas path implements messages 302 through 313. A shared renderer applies inline
+rectangle clips, positioned QMask bitmaps, solid and repeating pattern brushes, nearest or
+interpolated scaling, binary ROP descriptors, and arbitrary ROP3 truth tables. Stroke consumes
+bounded fixed28.4 paths with cosmetic line, dash, close, and Bezier handling. Text consumes bounded
+A1/A4/A8 raster glyphs. The client advertises a zero-byte pixmap cache, so cache-reference image
+types are not part of the negotiated stream; palette and GLZ caches remain independently bounded.
 
 | Format | Negotiation reality | Policy |
 | --- | --- | --- |
@@ -288,15 +297,23 @@ JPEG uses `zune-jpeg`; progressive JPEG uses `jpeg-decoder`; H.265 uses `rust_h2
 WebDAV local filesystem backend use Rust OS bindings such as `libc`, but no C SPICE client is linked.
 
 Composite rendering uses the MIT-licensed `pixman`/`pixman-sys` binding and dynamically links the
-system pixman library discovered by `pkg-config`. This native raster boundary implements the full
-SPICE/Pixman operation, transform, filter, repeat, component-alpha, clip, and A8 semantics; no
-SPICE client library is linked. Unix descriptor receipt uses safe `rustix` APIs and keeps all
+system pixman library discovered by `pkg-config`. This native raster boundary implements the
+operation, transform, filter, repeat, component-alpha, clip, and A8 semantics of Draw Composite;
+no SPICE client library is linked. Unix descriptor receipt uses safe `rustix` APIs and keeps all
 project crates under `unsafe_code = "forbid"`.
 
-SASL password mechanisms are provided by Rust `rsasl`. Enabling the compiled-in GSSAPI mechanism
-also brings `libgssapi`/`libgssapi-sys`, bindgen, and the system Kerberos/GSSAPI library. The native
-dependency is confined to authentication; the SPICE SASL wire framing and optional security-layer
-record framing remain owned by the Rust client.
+The client features `composite-pixman`, `audio-opus`, `sasl-gssapi`, `video-h264`, `video-h265`,
+and `video-vpx` select native raster, authentication, and media boundaries. They are enabled by
+default for the complete client and can be disabled independently. Capability advertisement is
+derived from the compiled feature set; a disabled codec or Composite backend is never advertised
+to the server. The helper forwards these switches and separately gates `tls-ring`, `usbredir`,
+`smartcard`, and `webdav`. Its IPC schema does not vary with the feature set; a request for a
+backend omitted at build time returns an explicit action error.
+
+SASL password mechanisms are provided by Rust `rsasl`. Enabling `sasl-gssapi` also brings
+`libgssapi`/`libgssapi-sys`, bindgen, and the system Kerberos/GSSAPI library. The native dependency
+is confined to authentication; the SPICE SASL wire framing and optional security-layer record
+framing remain owned by the Rust client.
 
 TLS is an explicit `oxide-spice-client/tls-ring` feature. It disables `tokio-rustls` defaults and
 selects `ring` plus TLS 1.2 support. `ring` compiles bundled C and assembly; that native code is
@@ -309,7 +326,8 @@ server name and rustls configuration; without that policy the migration fails be
 Native dependencies are isolated and explicit. `opus 0.4.0` uses `opusic-sys`, which compiles the
 BSD-licensed bundled libopus with CMake and may include platform assembly. The helper uses
 `usbredirhost 0.4.1`, transitively linking `usbredirparser-sys` and the system usbredir/libusb
-libraries dynamically, and `pcsc 2.9.0`, which uses `pcsc-sys` and the platform PC/SC service.
+libraries dynamically when its `usbredir` feature is enabled, and `pcsc 2.9.0`, which uses
+`pcsc-sys` and the platform PC/SC service when `smartcard` is enabled.
 usbredir/libusb are dynamically linked LGPL libraries and retain their own distribution terms.
 `oxide-spice-protocol` has none of these dependencies. Display and SpiceVMC LZ4 use safe-Rust
 `lz4_flex`, not `lz4-sys`.

@@ -27,7 +27,7 @@ use crate::agent::{AgentHandle, AgentTaskPaths, agent_paths};
 use crate::channel::link_channel_with_file_descriptors;
 use crate::channel::{
     BoxedStream, Channel, ChannelIdentity, ControlDisposition, ControlState,
-    DEFAULT_MAX_MESSAGE_BODY, IncomingMessage, LinkParameters, MigrationReplacement,
+    DEFAULT_MAX_MESSAGE_BODY, IncomingEnvelope, LinkParameters, MigrationReplacement,
     ProgressRegistry, handle_channel_wait, link_channel,
 };
 use crate::cursor::{CursorEvents, CursorState, cursor_events, run_cursor};
@@ -444,32 +444,40 @@ async fn await_seamless_decision(channel: &mut Channel<BoxedStream>) -> Result<b
     let mut control = ControlState::new();
     loop {
         let header = channel.read_message(&mut body).await?;
-        let message = IncomingMessage {
-            header,
-            body: &body,
-        };
-        if control.handle(channel, &message).await? == ControlDisposition::Consumed {
-            continue;
+        let envelope = IncomingEnvelope::decode(header, &body)?;
+        let counts_for_ack = envelope.counts_for_ack();
+        let mut decision = None;
+        for message in envelope.messages() {
+            if control.handle_without_ack(channel, &message).await? == ControlDisposition::Consumed
+            {
+                continue;
+            }
+            match message.header.message_type {
+                main_server::MIGRATE_DST_SEAMLESS_ACK => {
+                    if !message.body.is_empty() {
+                        return Err(protocol_value_error("seamless migration ACK body"));
+                    }
+                    decision = Some(true);
+                }
+                main_server::MIGRATE_DST_SEAMLESS_NACK => {
+                    if !message.body.is_empty() {
+                        return Err(protocol_value_error("seamless migration NACK body"));
+                    }
+                    decision = Some(false);
+                }
+                message_type => {
+                    return Err(ClientError::UnsupportedMessage {
+                        channel: "migration target Main",
+                        message_type,
+                    });
+                }
+            }
         }
-        match message.header.message_type {
-            main_server::MIGRATE_DST_SEAMLESS_ACK => {
-                if !message.body.is_empty() {
-                    return Err(protocol_value_error("seamless migration ACK body"));
-                }
-                return Ok(true);
-            }
-            main_server::MIGRATE_DST_SEAMLESS_NACK => {
-                if !message.body.is_empty() {
-                    return Err(protocol_value_error("seamless migration NACK body"));
-                }
-                return Ok(false);
-            }
-            message_type => {
-                return Err(ClientError::UnsupportedMessage {
-                    channel: "migration target Main",
-                    message_type,
-                });
-            }
+        if counts_for_ack {
+            control.acknowledge_envelope(channel).await?;
+        }
+        if let Some(decision) = decision {
+            return Ok(decision);
         }
     }
 }
@@ -752,19 +760,34 @@ impl Session {
         let display_capability_bits = vec![
             display_capability::SIZED_STREAM,
             display_capability::MONITORS_CONFIG,
-            display_capability::COMPOSITE,
             display_capability::A8_SURFACE,
             display_capability::STREAM_REPORT,
             display_capability::LZ4_COMPRESSION,
             display_capability::PREFERRED_COMPRESSION,
             display_capability::MULTI_CODEC,
             display_capability::CODEC_MJPEG,
-            display_capability::CODEC_VP8,
-            display_capability::CODEC_H264,
             display_capability::PREFERRED_VIDEO_CODEC,
-            display_capability::CODEC_VP9,
-            display_capability::CODEC_H265,
         ];
+        #[cfg(feature = "video-vpx")]
+        let display_capability_bits = display_capability_bits
+            .into_iter()
+            .chain([display_capability::CODEC_VP8, display_capability::CODEC_VP9])
+            .collect::<Vec<_>>();
+        #[cfg(feature = "video-h264")]
+        let display_capability_bits = display_capability_bits
+            .into_iter()
+            .chain([display_capability::CODEC_H264])
+            .collect::<Vec<_>>();
+        #[cfg(feature = "video-h265")]
+        let display_capability_bits = display_capability_bits
+            .into_iter()
+            .chain([display_capability::CODEC_H265])
+            .collect::<Vec<_>>();
+        #[cfg(feature = "composite-pixman")]
+        let display_capability_bits = display_capability_bits
+            .into_iter()
+            .chain([display_capability::COMPOSITE])
+            .collect::<Vec<_>>();
         #[cfg(target_os = "linux")]
         let display_capability_bits = if options.enable_gl_scanout
             && matches!(options.endpoint, ConnectionEndpoint::Unix { .. })
@@ -856,6 +879,13 @@ impl Session {
                 maximum: options.maximum_playback_channels,
             });
         }
+        let playback_capabilities = vec![playback_capability::VOLUME, playback_capability::LATENCY];
+        #[cfg(feature = "audio-opus")]
+        let playback_capabilities = playback_capabilities
+            .into_iter()
+            .chain([playback_capability::OPUS])
+            .collect::<Vec<_>>();
+        let playback_capabilities = CapabilitySet::from_bits(playback_capabilities)?;
         let mut playback_transports = Vec::with_capacity(playback_ids.len());
         for playback in playback_ids {
             let channel = timeout(
@@ -865,11 +895,7 @@ impl Session {
                     main_init.session_id,
                     playback,
                     common_capabilities.clone(),
-                    CapabilitySet::from_bits([
-                        playback_capability::VOLUME,
-                        playback_capability::LATENCY,
-                        playback_capability::OPUS,
-                    ])?,
+                    playback_capabilities.clone(),
                 ),
             )
             .await
@@ -890,6 +916,13 @@ impl Session {
                 maximum: options.maximum_record_channels,
             });
         }
+        let record_capabilities = vec![record_capability::VOLUME];
+        #[cfg(feature = "audio-opus")]
+        let record_capabilities = record_capabilities
+            .into_iter()
+            .chain([record_capability::OPUS])
+            .collect::<Vec<_>>();
+        let record_capabilities = CapabilitySet::from_bits(record_capabilities)?;
         let mut record_transports = Vec::with_capacity(record_ids.len());
         for record in record_ids {
             let channel = timeout(
@@ -899,7 +932,7 @@ impl Session {
                     main_init.session_id,
                     record,
                     common_capabilities.clone(),
-                    CapabilitySet::from_bits([record_capability::VOLUME, record_capability::OPUS])?,
+                    record_capabilities.clone(),
                 ),
             )
             .await
@@ -1711,104 +1744,143 @@ where
 {
     let mut control = ControlState::new();
     let mut message_body = Vec::new();
-    let main_init = loop {
-        let header = channel.read_message(&mut message_body).await?;
-        let message = IncomingMessage {
-            header,
-            body: &message_body,
-        };
-        if control.handle(&mut channel, &message).await? == ControlDisposition::Consumed {
-            continue;
-        }
-        if message.header.message_type == main_server::INIT {
-            break MainInit::decode(message.body)?;
-        }
-        return Err(ClientError::UnsupportedMessage {
-            channel: "main bootstrap",
-            message_type: message.header.message_type,
-        });
-    };
-    channel
-        .write_message(main_client::ATTACH_CHANNELS, &[])
-        .await?;
-    let mut mouse_mode = main_init.mouse_mode_state()?;
-    let mut agent_state = AgentBootstrapState {
-        connected: main_init.agent_connected,
-        outbound_tokens: u64::from(main_init.agent_tokens),
-        disconnect_reason: None,
-    };
+    let mut main_init = None;
+    let mut channels = None;
+    let mut mouse_mode = None;
+    let mut agent_state = None;
     let mut server_identity = ServerIdentity::default();
-    request_client_mouse_mode(&mut channel, mouse_mode).await?;
-    let channels = loop {
+    loop {
         let header = channel.read_message(&mut message_body).await?;
-        let message = IncomingMessage {
-            header,
-            body: &message_body,
-        };
-        if control.handle(&mut channel, &message).await? == ControlDisposition::Consumed {
-            continue;
-        }
-        match message.header.message_type {
-            main_server::CHANNELS_LIST => break ChannelsList::decode(message.body)?,
-            main_server::MOUSE_MODE => {
-                mouse_mode = MouseModeState::decode(message.body)?;
+        let envelope = IncomingEnvelope::decode(header, &message_body)?;
+        let counts_for_ack = envelope.counts_for_ack();
+        for message in envelope.messages() {
+            if control.handle_without_ack(&mut channel, &message).await?
+                == ControlDisposition::Consumed
+            {
+                continue;
             }
-            main_server::AGENT_CONNECTED => {
-                if !message.body.is_empty() {
-                    return Err(protocol_value_error("Main Agent Connected body"));
+            match message.header.message_type {
+                main_server::INIT => {
+                    if main_init.is_some() {
+                        return Err(protocol_value_error("repeated Main Init"));
+                    }
+                    let decoded = MainInit::decode(message.body)?;
+                    let initial_mouse_mode = decoded.mouse_mode_state()?;
+                    mouse_mode = Some(initial_mouse_mode);
+                    agent_state = Some(AgentBootstrapState {
+                        connected: decoded.agent_connected,
+                        outbound_tokens: u64::from(decoded.agent_tokens),
+                        disconnect_reason: None,
+                    });
+                    main_init = Some(decoded);
+                    channel
+                        .write_message(main_client::ATTACH_CHANNELS, &[])
+                        .await?;
+                    request_client_mouse_mode(&mut channel, initial_mouse_mode).await?;
                 }
-                agent_state.connected = true;
-                agent_state.disconnect_reason = None;
-            }
-            main_server::AGENT_CONNECTED_TOKENS => {
-                agent_state.connected = true;
-                agent_state.outbound_tokens = u64::from(decode_agent_u32(
-                    message.body,
-                    "Main Agent Connected tokens",
-                )?);
-                agent_state.disconnect_reason = None;
-            }
-            main_server::AGENT_DISCONNECTED => {
-                agent_state.connected = false;
-                agent_state.disconnect_reason = Some(decode_agent_u32(
-                    message.body,
-                    "Main Agent disconnect reason",
-                )?);
-            }
-            main_server::AGENT_TOKEN => {
-                let tokens = u64::from(decode_agent_u32(message.body, "Main Agent tokens")?);
-                agent_state.outbound_tokens = agent_state
-                    .outbound_tokens
-                    .checked_add(tokens)
-                    .ok_or_else(|| resource_limit_error("Main Agent token count"))?;
-            }
-            main_server::AGENT_DATA => {
-                return Err(protocol_value_error("Agent data before Agent Start"));
-            }
-            main_server::MULTI_MEDIA_TIME => {}
-            main_server::NAME => {
-                server_identity.name = Some(Arc::from(decode_main_name(message.body)?));
-            }
-            main_server::UUID => {
-                server_identity.uuid = Some(decode_main_uuid(message.body)?);
-            }
-            message_type => {
-                return Err(ClientError::UnsupportedMessage {
-                    channel: "main discovery",
-                    message_type,
-                });
+                main_server::CHANNELS_LIST => {
+                    if main_init.is_none() {
+                        return Err(protocol_value_error("Main Channels List before Init"));
+                    }
+                    if channels.is_some() {
+                        return Err(protocol_value_error("repeated Main Channels List"));
+                    }
+                    channels = Some(ChannelsList::decode(message.body)?);
+                }
+                main_server::MOUSE_MODE => {
+                    require_main_init(&main_init)?;
+                    mouse_mode = Some(MouseModeState::decode(message.body)?);
+                }
+                main_server::AGENT_CONNECTED => {
+                    if !message.body.is_empty() {
+                        return Err(protocol_value_error("Main Agent Connected body"));
+                    }
+                    let state = require_agent_bootstrap(&mut agent_state)?;
+                    state.connected = true;
+                    state.disconnect_reason = None;
+                }
+                main_server::AGENT_CONNECTED_TOKENS => {
+                    let state = require_agent_bootstrap(&mut agent_state)?;
+                    state.connected = true;
+                    state.outbound_tokens = u64::from(decode_agent_u32(
+                        message.body,
+                        "Main Agent Connected tokens",
+                    )?);
+                    state.disconnect_reason = None;
+                }
+                main_server::AGENT_DISCONNECTED => {
+                    let state = require_agent_bootstrap(&mut agent_state)?;
+                    state.connected = false;
+                    state.disconnect_reason = Some(decode_agent_u32(
+                        message.body,
+                        "Main Agent disconnect reason",
+                    )?);
+                }
+                main_server::AGENT_TOKEN => {
+                    let state = require_agent_bootstrap(&mut agent_state)?;
+                    let tokens = u64::from(decode_agent_u32(message.body, "Main Agent tokens")?);
+                    state.outbound_tokens = state
+                        .outbound_tokens
+                        .checked_add(tokens)
+                        .ok_or_else(|| resource_limit_error("Main Agent token count"))?;
+                }
+                main_server::AGENT_DATA => {
+                    return Err(protocol_value_error("Agent data before Agent Start"));
+                }
+                main_server::MULTI_MEDIA_TIME => {
+                    require_main_init(&main_init)?;
+                }
+                main_server::NAME => {
+                    require_main_init(&main_init)?;
+                    server_identity.name = Some(Arc::from(decode_main_name(message.body)?));
+                }
+                main_server::UUID => {
+                    require_main_init(&main_init)?;
+                    server_identity.uuid = Some(decode_main_uuid(message.body)?);
+                }
+                message_type => {
+                    return Err(ClientError::UnsupportedMessage {
+                        channel: if main_init.is_some() {
+                            "main discovery"
+                        } else {
+                            "main bootstrap"
+                        },
+                        message_type,
+                    });
+                }
             }
         }
-    };
+        if counts_for_ack {
+            control.acknowledge_envelope(&mut channel).await?;
+        }
+        if channels.is_some() {
+            break;
+        }
+    }
     Ok((
         channel,
-        main_init,
-        channels,
-        mouse_mode,
-        agent_state,
+        main_init.expect("channels require Main Init"),
+        channels.expect("bootstrap loop exits with Channels List"),
+        mouse_mode.expect("Main Init establishes mouse mode"),
+        agent_state.expect("Main Init establishes Agent state"),
         server_identity,
         control,
     ))
+}
+
+fn require_main_init(main_init: &Option<MainInit>) -> Result<(), ClientError> {
+    main_init
+        .as_ref()
+        .map(|_| ())
+        .ok_or_else(|| protocol_value_error("Main message before Init"))
+}
+
+fn require_agent_bootstrap(
+    state: &mut Option<AgentBootstrapState>,
+) -> Result<&mut AgentBootstrapState, ClientError> {
+    state
+        .as_mut()
+        .ok_or_else(|| protocol_value_error("Main Agent message before Init"))
 }
 
 /// Requests absolute client mouse mode only when the server currently permits it.
@@ -2158,7 +2230,8 @@ where
             }
             incoming = channel.read_message(&mut message_body) => {
                 let header = incoming?;
-                let message = IncomingMessage { header, body: &message_body };
+                let envelope = IncomingEnvelope::decode(header, &message_body)?;
+                let counts_for_ack = envelope.counts_for_ack();
                 let mut serial = channel.received_serial();
                 if let Some(seamless) =
                     channel.observe_migration_activation(&mut observed_migration_activation)
@@ -2167,26 +2240,26 @@ where
                     awaiting_nonseamless_main_init = true;
                     server_identity_sender.send_replace(ServerIdentity::default());
                 }
-                if control.handle(&mut channel, &message).await? == ControlDisposition::Consumed {
-                    progress.complete(identity, serial)?;
-                    continue;
-                }
-                if handle_channel_wait(&progress, identity, serial, &mut cancel, &message).await? {
-                    progress.complete(identity, serial)?;
-                    continue;
-                }
-                if agent
-                    .handle_server_message(
-                        message.header.message_type,
-                        message.body,
-                        &mut channel,
-                    )
-                    .await?
-                {
-                    progress.complete(identity, serial)?;
-                    continue;
-                }
-                match message.header.message_type {
+                for message in envelope.messages() {
+                    if control.handle_without_ack(&mut channel, &message).await?
+                        == ControlDisposition::Consumed
+                    {
+                        continue;
+                    }
+                    if handle_channel_wait(&progress, identity, serial, &mut cancel, &message).await? {
+                        continue;
+                    }
+                    if agent
+                        .handle_server_message(
+                            message.header.message_type,
+                            message.body,
+                            &mut channel,
+                        )
+                        .await?
+                    {
+                        continue;
+                    }
+                    match message.header.message_type {
                     main_server::CHANNELS_LIST => {
                         let _ = ChannelsList::decode(message.body)?;
                     }
@@ -2314,6 +2387,10 @@ where
                             message_type,
                         });
                     }
+                    }
+                }
+                if counts_for_ack {
+                    control.acknowledge_envelope(&mut channel).await?;
                 }
                 progress.complete(identity, serial)?;
             }
@@ -3013,16 +3090,20 @@ mod tests {
             )
             .await;
 
+            let display_submessages = encode_submessage_list(&[
+                (
+                    oxide_spice_protocol::display_server::INVALIDATE_ALL_PIXMAPS,
+                    &[0][..],
+                ),
+                (
+                    oxide_spice_protocol::display_server::INVALIDATE_ALL_PALETTES,
+                    &[],
+                ),
+            ]);
             write_mini_message(
                 &mut display_stream,
-                oxide_spice_protocol::display_server::INVALIDATE_ALL_PIXMAPS,
-                &[0],
-            )
-            .await;
-            write_mini_message(
-                &mut display_stream,
-                oxide_spice_protocol::display_server::INVALIDATE_ALL_PALETTES,
-                &[],
+                oxide_spice_protocol::common_server::LIST,
+                &display_submessages,
             )
             .await;
 
@@ -3819,6 +3900,41 @@ mod tests {
             .await
             .expect("message size");
         stream.write_all(body).await.expect("message body");
+    }
+
+    /// Encodes a bounded mini-header LIST envelope without hard-coded message offsets.
+    fn encode_submessage_list(messages: &[(u16, &[u8])]) -> Vec<u8> {
+        let table_bytes = messages
+            .len()
+            .checked_mul(4)
+            .and_then(|bytes| bytes.checked_add(2))
+            .expect("bounded test sub-message table");
+        let mut next_offset = table_bytes;
+        let mut output = u16::try_from(messages.len())
+            .expect("bounded test sub-message count")
+            .to_le_bytes()
+            .to_vec();
+        for (_, body) in messages {
+            output.extend_from_slice(
+                &u32::try_from(next_offset)
+                    .expect("bounded test sub-message offset")
+                    .to_le_bytes(),
+            );
+            next_offset = next_offset
+                .checked_add(6)
+                .and_then(|offset| offset.checked_add(body.len()))
+                .expect("bounded test sub-message bytes");
+        }
+        for (message_type, body) in messages {
+            output.extend_from_slice(&message_type.to_le_bytes());
+            output.extend_from_slice(
+                &u32::try_from(body.len())
+                    .expect("bounded test sub-message body")
+                    .to_le_bytes(),
+            );
+            output.extend_from_slice(body);
+        }
+        output
     }
 
     /// Reads one client mini-header message and its bounded test body.

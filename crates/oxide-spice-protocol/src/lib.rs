@@ -6,6 +6,7 @@
 mod agent;
 mod capability;
 mod channel;
+mod classic_display;
 mod cursor;
 mod display;
 mod error;
@@ -40,8 +41,15 @@ pub use agent::{
 };
 pub use capability::{CapabilitySet, MAX_CAPABILITY_WORDS};
 pub use channel::{
-    ChannelType, ChannelWait, DataHeader, Framing, MAX_CHANNEL_WAITS, WaitForChannels,
-    common_client, common_server,
+    ChannelType, ChannelWait, DataHeader, Framing, MAX_CHANNEL_WAITS, MAX_SUBMESSAGES, SubMessage,
+    SubMessageList, SubMessages, WaitForChannels, common_client, common_server,
+};
+pub use classic_display::{
+    DisplayBase, DisplayBrush, DisplayImageSource, DisplayMask, DisplayPath, DrawAlphaBlend,
+    DrawBlend, DrawCopy, DrawFill, DrawMaskedDestination, DrawOpaque, DrawRop3, DrawStroke,
+    DrawText, DrawTransparent, FixedPoint, GlyphFormat, LineAttributes, MAX_PATH_POINTS,
+    MAX_PATH_SEGMENTS, MAX_RASTER_GLYPH_BYTES, MAX_RASTER_GLYPHS, PathSegment, Point, RasterGlyph,
+    RasterString,
 };
 pub use cursor::{
     CursorHeader, CursorImage, CursorInit, CursorPosition, CursorSet, CursorType, cursor_server,
@@ -52,11 +60,11 @@ pub use display::{
     CompositeImage, CompositeSurface, CompositeTransform, CompressedImageUpdate, CopyBits,
     DisplayInit, DrawComposite, DrawCopyImageType, EmbeddedBitmap, EmbeddedCompressedImage,
     EmbeddedImage, EmbeddedJpeg, GlDraw, GlScanout2Unix, GlScanoutPlane, GlScanoutUnix,
-    ImageCompression, JpegUpdate, MAX_COMPOSITE_CLIP_RECTS, MAX_GL_SCANOUT_PLANES,
-    MAX_MONITOR_HEADS, MonitorHead, MonitorsConfig, Point16, Rect, SolidFill, StreamClip,
-    StreamClipUpdate, StreamCreate, StreamData, StreamReport, StreamReportActivation,
-    SurfaceCreate, SurfaceFormat, VideoCodec, display_client, display_server,
-    encode_preferred_video_codecs,
+    ImageCompression, InvalidateList, InvalidateResource, JpegUpdate, MAX_COMPOSITE_CLIP_RECTS,
+    MAX_GL_SCANOUT_PLANES, MAX_INVALIDATE_RESOURCES, MAX_MONITOR_HEADS, MonitorHead,
+    MonitorsConfig, Point16, Rect, StreamClip, StreamClipUpdate, StreamCreate, StreamData,
+    StreamReport, StreamReportActivation, SurfaceCreate, SurfaceFormat, VideoCodec, display_client,
+    display_server, encode_preferred_video_codecs,
 };
 pub use error::{DecodeError, DecodeErrorKind};
 pub use inputs::{

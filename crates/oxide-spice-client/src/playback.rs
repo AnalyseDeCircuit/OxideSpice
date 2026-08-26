@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::ClientError;
 use crate::channel::{
-    Channel, ChannelIdentity, ControlDisposition, ControlState, IncomingMessage, ProgressRegistry,
+    Channel, ChannelIdentity, ControlDisposition, ControlState, IncomingEnvelope, ProgressRegistry,
     handle_channel_wait,
 };
 
@@ -252,10 +252,8 @@ where
             }
             incoming = channel.read_message(&mut message_body) => incoming?,
         };
-        let message = IncomingMessage {
-            header,
-            body: &message_body,
-        };
+        let envelope = IncomingEnvelope::decode(header, &message_body)?;
+        let counts_for_ack = envelope.counts_for_ack();
         let serial = channel.received_serial();
         if let Some(seamless) =
             channel.observe_migration_activation(&mut observed_migration_activation)
@@ -275,155 +273,160 @@ where
             });
             audio_sender.send_replace(PlaybackAudioSettings::default());
         }
-        if control.handle(&mut channel, &message).await? == ControlDisposition::Consumed {
-            progress.complete(identity, serial)?;
-            continue;
-        }
-        if handle_channel_wait(&progress, identity, serial, &mut cancel, &message).await? {
-            progress.complete(identity, serial)?;
-            continue;
-        }
+        for message in envelope.messages() {
+            if control.handle_without_ack(&mut channel, &message).await?
+                == ControlDisposition::Consumed
+            {
+                continue;
+            }
+            if handle_channel_wait(&progress, identity, serial, &mut cancel, &message).await? {
+                continue;
+            }
 
-        match message.header.message_type {
-            playback_server::MODE => {
-                let mode = PlaybackMode::decode(message.body)?;
-                if mode.mode != AudioDataMode::Raw {
-                    if mode.mode != AudioDataMode::Opus {
-                        return Err(unsupported_playback_mode());
+            match message.header.message_type {
+                playback_server::MODE => {
+                    let mode = PlaybackMode::decode(message.body)?;
+                    if mode.mode != AudioDataMode::Raw {
+                        if mode.mode != AudioDataMode::Opus {
+                            return Err(unsupported_playback_mode());
+                        }
                     }
-                }
-                mode_timestamp_ms = Some(mode.timestamp_ms);
-                data_mode = Some(mode.mode);
-                opus_decoder = match (mode.mode, active_format) {
-                    (AudioDataMode::Opus, Some(format)) => Some(SpiceOpusDecoder::new(
-                        format.channels,
-                        format.sample_rate_hz,
-                    )?),
-                    _ => None,
-                };
-                let state = match active_format {
-                    Some(format) => PlaybackState::Started {
-                        connection_generation,
-                        channel_id,
-                        stream_generation,
-                        mode_timestamp_ms: mode.timestamp_ms,
-                        start_timestamp_ms: active_start_timestamp_ms
-                            .expect("start timestamp exists with active format"),
-                        format,
-                    },
-                    None => PlaybackState::Stopped {
-                        connection_generation,
-                        channel_id,
-                        stream_generation,
-                        mode_timestamp_ms: mode.timestamp_ms,
-                    },
-                };
-                state_sender.send_replace(state);
-            }
-            playback_server::START => {
-                if active_format.is_some() || mode_timestamp_ms.is_none() {
-                    return Err(protocol_value_error("Playback Start state"));
-                }
-                let start = PlaybackStart::decode(message.body)?;
-                stream_generation = stream_generation
-                    .checked_add(1)
-                    .ok_or_else(|| resource_limit_error("Playback stream generation"))?;
-                sequence = 0;
-                discontinuity = false;
-                let format = PlaybackFormat::from(start);
-                opus_decoder = match data_mode.expect("mode checked before Start") {
-                    AudioDataMode::Raw => None,
-                    AudioDataMode::Opus => Some(SpiceOpusDecoder::new(
-                        format.channels,
-                        format.sample_rate_hz,
-                    )?),
-                    AudioDataMode::Celt051 => return Err(unsupported_playback_mode()),
-                };
-                active_format = Some(format);
-                active_start_timestamp_ms = Some(start.timestamp_ms);
-                state_sender.send_replace(PlaybackState::Started {
-                    connection_generation,
-                    channel_id,
-                    stream_generation,
-                    mode_timestamp_ms: mode_timestamp_ms.expect("mode checked before Start"),
-                    start_timestamp_ms: start.timestamp_ms,
-                    format,
-                });
-            }
-            playback_server::DATA => {
-                let format = active_format
-                    .ok_or_else(|| protocol_value_error("Playback Data before Start"))?;
-                let packet = WirePlaybackPacket::decode(message.body)?;
-                let frame_bytes = format.frame_bytes()?;
-                let pcm: Arc<[u8]> = match data_mode
-                    .ok_or_else(|| protocol_value_error("Playback Data before Mode"))?
-                {
-                    AudioDataMode::Raw => Arc::from(packet.data),
-                    AudioDataMode::Opus => {
-                        opus_decoder
-                            .as_mut()
-                            .ok_or_else(|| protocol_value_error("Playback Opus decoder state"))?
-                            .decode_packet(packet.data, &mut decoded_pcm)?;
-                        Arc::from(decoded_pcm.as_slice())
-                    }
-                    AudioDataMode::Celt051 => return Err(unsupported_playback_mode()),
-                };
-                if !pcm.len().is_multiple_of(frame_bytes) {
-                    return Err(protocol_value_error("Playback packet frame alignment"));
-                }
-                let packet_sequence = sequence;
-                sequence = sequence
-                    .checked_add(1)
-                    .ok_or_else(|| resource_limit_error("Playback packet sequence"))?;
-                if !packet_sender.is_closed() {
-                    let owned = PlaybackPcmPacket {
-                        connection_generation,
-                        channel_id,
-                        stream_generation,
-                        sequence: packet_sequence,
-                        timestamp_ms: packet.timestamp_ms,
-                        format,
-                        interleaved_s16le: pcm,
-                        discontinuity,
+                    mode_timestamp_ms = Some(mode.timestamp_ms);
+                    data_mode = Some(mode.mode);
+                    opus_decoder = match (mode.mode, active_format) {
+                        (AudioDataMode::Opus, Some(format)) => Some(SpiceOpusDecoder::new(
+                            format.channels,
+                            format.sample_rate_hz,
+                        )?),
+                        _ => None,
                     };
-                    match packet_sender.try_send(owned) {
-                        Ok(()) => discontinuity = false,
-                        Err(mpsc::error::TrySendError::Full(_)) => discontinuity = true,
-                        Err(mpsc::error::TrySendError::Closed(_)) => discontinuity = true,
+                    let state = match active_format {
+                        Some(format) => PlaybackState::Started {
+                            connection_generation,
+                            channel_id,
+                            stream_generation,
+                            mode_timestamp_ms: mode.timestamp_ms,
+                            start_timestamp_ms: active_start_timestamp_ms
+                                .expect("start timestamp exists with active format"),
+                            format,
+                        },
+                        None => PlaybackState::Stopped {
+                            connection_generation,
+                            channel_id,
+                            stream_generation,
+                            mode_timestamp_ms: mode.timestamp_ms,
+                        },
+                    };
+                    state_sender.send_replace(state);
+                }
+                playback_server::START => {
+                    if active_format.is_some() || mode_timestamp_ms.is_none() {
+                        return Err(protocol_value_error("Playback Start state"));
+                    }
+                    let start = PlaybackStart::decode(message.body)?;
+                    stream_generation = stream_generation
+                        .checked_add(1)
+                        .ok_or_else(|| resource_limit_error("Playback stream generation"))?;
+                    sequence = 0;
+                    discontinuity = false;
+                    let format = PlaybackFormat::from(start);
+                    opus_decoder = match data_mode.expect("mode checked before Start") {
+                        AudioDataMode::Raw => None,
+                        AudioDataMode::Opus => Some(SpiceOpusDecoder::new(
+                            format.channels,
+                            format.sample_rate_hz,
+                        )?),
+                        AudioDataMode::Celt051 => return Err(unsupported_playback_mode()),
+                    };
+                    active_format = Some(format);
+                    active_start_timestamp_ms = Some(start.timestamp_ms);
+                    state_sender.send_replace(PlaybackState::Started {
+                        connection_generation,
+                        channel_id,
+                        stream_generation,
+                        mode_timestamp_ms: mode_timestamp_ms.expect("mode checked before Start"),
+                        start_timestamp_ms: start.timestamp_ms,
+                        format,
+                    });
+                }
+                playback_server::DATA => {
+                    let format = active_format
+                        .ok_or_else(|| protocol_value_error("Playback Data before Start"))?;
+                    let packet = WirePlaybackPacket::decode(message.body)?;
+                    let frame_bytes = format.frame_bytes()?;
+                    let pcm: Arc<[u8]> = match data_mode
+                        .ok_or_else(|| protocol_value_error("Playback Data before Mode"))?
+                    {
+                        AudioDataMode::Raw => Arc::from(packet.data),
+                        AudioDataMode::Opus => {
+                            opus_decoder
+                                .as_mut()
+                                .ok_or_else(|| protocol_value_error("Playback Opus decoder state"))?
+                                .decode_packet(packet.data, &mut decoded_pcm)?;
+                            Arc::from(decoded_pcm.as_slice())
+                        }
+                        AudioDataMode::Celt051 => return Err(unsupported_playback_mode()),
+                    };
+                    if !pcm.len().is_multiple_of(frame_bytes) {
+                        return Err(protocol_value_error("Playback packet frame alignment"));
+                    }
+                    let packet_sequence = sequence;
+                    sequence = sequence
+                        .checked_add(1)
+                        .ok_or_else(|| resource_limit_error("Playback packet sequence"))?;
+                    if !packet_sender.is_closed() {
+                        let owned = PlaybackPcmPacket {
+                            connection_generation,
+                            channel_id,
+                            stream_generation,
+                            sequence: packet_sequence,
+                            timestamp_ms: packet.timestamp_ms,
+                            format,
+                            interleaved_s16le: pcm,
+                            discontinuity,
+                        };
+                        match packet_sender.try_send(owned) {
+                            Ok(()) => discontinuity = false,
+                            Err(mpsc::error::TrySendError::Full(_)) => discontinuity = true,
+                            Err(mpsc::error::TrySendError::Closed(_)) => discontinuity = true,
+                        }
                     }
                 }
-            }
-            playback_server::STOP => {
-                if !message.body.is_empty() || active_format.take().is_none() {
-                    return Err(protocol_value_error("Playback Stop state"));
+                playback_server::STOP => {
+                    if !message.body.is_empty() || active_format.take().is_none() {
+                        return Err(protocol_value_error("Playback Stop state"));
+                    }
+                    active_start_timestamp_ms = None;
+                    opus_decoder = None;
+                    state_sender.send_replace(PlaybackState::Stopped {
+                        connection_generation,
+                        channel_id,
+                        stream_generation,
+                        mode_timestamp_ms: mode_timestamp_ms.expect("mode exists while started"),
+                    });
                 }
-                active_start_timestamp_ms = None;
-                opus_decoder = None;
-                state_sender.send_replace(PlaybackState::Stopped {
-                    connection_generation,
-                    channel_id,
-                    stream_generation,
-                    mode_timestamp_ms: mode_timestamp_ms.expect("mode exists while started"),
-                });
+                playback_server::VOLUME => {
+                    let volume: Arc<[u16]> = decode_audio_volume(message.body)?.into();
+                    audio_sender.send_modify(|settings| settings.volume = volume);
+                }
+                playback_server::MUTE => {
+                    let muted = decode_audio_mute(message.body)?;
+                    audio_sender.send_modify(|settings| settings.muted = muted);
+                }
+                playback_server::LATENCY => {
+                    let latency_ms = decode_playback_latency(message.body)?;
+                    audio_sender.send_modify(|settings| settings.latency_ms = Some(latency_ms));
+                }
+                message_type => {
+                    return Err(ClientError::UnsupportedMessage {
+                        channel: "playback",
+                        message_type,
+                    });
+                }
             }
-            playback_server::VOLUME => {
-                let volume: Arc<[u16]> = decode_audio_volume(message.body)?.into();
-                audio_sender.send_modify(|settings| settings.volume = volume);
-            }
-            playback_server::MUTE => {
-                let muted = decode_audio_mute(message.body)?;
-                audio_sender.send_modify(|settings| settings.muted = muted);
-            }
-            playback_server::LATENCY => {
-                let latency_ms = decode_playback_latency(message.body)?;
-                audio_sender.send_modify(|settings| settings.latency_ms = Some(latency_ms));
-            }
-            message_type => {
-                return Err(ClientError::UnsupportedMessage {
-                    channel: "playback",
-                    message_type,
-                });
-            }
+        }
+        if counts_for_ack {
+            control.acknowledge_envelope(&mut channel).await?;
         }
         progress.complete(identity, serial)?;
     }

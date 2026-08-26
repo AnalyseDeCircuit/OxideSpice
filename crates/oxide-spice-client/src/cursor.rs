@@ -13,7 +13,7 @@ use tokio::sync::watch;
 
 use crate::ClientError;
 use crate::channel::{
-    Channel, ChannelIdentity, ControlDisposition, ControlState, IncomingMessage, ProgressRegistry,
+    Channel, ChannelIdentity, ControlDisposition, ControlState, IncomingEnvelope, ProgressRegistry,
     handle_channel_wait,
 };
 
@@ -222,10 +222,8 @@ where
             }
             incoming = channel.read_message(&mut message_body) => incoming?,
         };
-        let message = IncomingMessage {
-            header,
-            body: &message_body,
-        };
+        let envelope = IncomingEnvelope::decode(header, &message_body)?;
+        let counts_for_ack = envelope.counts_for_ack();
         let serial = channel.received_serial();
         if let Some(seamless) =
             channel.observe_migration_activation(&mut observed_migration_activation)
@@ -245,78 +243,84 @@ where
             awaiting_init = true;
             state_sender.send_replace(None);
         }
-        if control.handle(&mut channel, &message).await? == ControlDisposition::Consumed {
-            progress.complete(identity, serial)?;
-            continue;
-        }
-        if handle_channel_wait(&progress, identity, serial, &mut cancel, &message).await? {
-            progress.complete(identity, serial)?;
-            continue;
-        }
-        if awaiting_init && message.header.message_type != cursor_server::INIT {
-            return Err(protocol_value_error("Cursor message before Init"));
-        }
-        match message.header.message_type {
-            cursor_server::INIT => {
-                if !awaiting_init {
-                    return Err(protocol_value_error("repeated Cursor Init"));
+        for message in envelope.messages() {
+            if control.handle_without_ack(&mut channel, &message).await?
+                == ControlDisposition::Consumed
+            {
+                continue;
+            }
+            if handle_channel_wait(&progress, identity, serial, &mut cancel, &message).await? {
+                continue;
+            }
+            if awaiting_init && message.header.message_type != cursor_server::INIT {
+                return Err(protocol_value_error("Cursor message before Init"));
+            }
+            match message.header.message_type {
+                cursor_server::INIT => {
+                    if !awaiting_init {
+                        return Err(protocol_value_error("repeated Cursor Init"));
+                    }
+                    let update = CursorInit::decode(message.body)?;
+                    cache.clear();
+                    state.position = update.position;
+                    state.trail_length = update.trail_length;
+                    state.trail_frequency = update.trail_frequency;
+                    state.visible = update.visible;
+                    state.shape = resolve_image(update.image, &mut cache, &budget)?;
+                    awaiting_init = false;
                 }
-                let update = CursorInit::decode(message.body)?;
-                cache.clear();
-                state.position = update.position;
-                state.trail_length = update.trail_length;
-                state.trail_frequency = update.trail_frequency;
-                state.visible = update.visible;
-                state.shape = resolve_image(update.image, &mut cache, &budget)?;
-                awaiting_init = false;
+                cursor_server::RESET => {
+                    require_empty(message.body, "cursor reset body")?;
+                    let next_epoch = state
+                        .cursor_epoch
+                        .checked_add(1)
+                        .ok_or_else(|| resource_limit_error("cursor epoch"))?;
+                    state = CursorState {
+                        connection_generation,
+                        channel_id,
+                        cursor_epoch: next_epoch,
+                        ..CursorState::default()
+                    };
+                    cache.clear();
+                    awaiting_init = true;
+                }
+                cursor_server::SET => {
+                    let update = CursorSet::decode(message.body)?;
+                    state.position = update.position;
+                    state.visible = update.visible;
+                    state.shape = resolve_image(update.image, &mut cache, &budget)?;
+                }
+                cursor_server::MOVE => {
+                    state.position = decode_cursor_position(message.body)?;
+                    state.visible = true;
+                }
+                cursor_server::HIDE => {
+                    require_empty(message.body, "cursor hide body")?;
+                    state.visible = false;
+                }
+                cursor_server::TRAIL => {
+                    (state.trail_length, state.trail_frequency) =
+                        decode_cursor_trail(message.body)?;
+                }
+                cursor_server::INVALIDATE_ONE => {
+                    cache.remove(decode_cursor_cache_id(message.body)?);
+                }
+                cursor_server::INVALIDATE_ALL => {
+                    require_empty(message.body, "cursor invalidate all body")?;
+                    cache.clear();
+                }
+                message_type => {
+                    return Err(ClientError::UnsupportedMessage {
+                        channel: "cursor",
+                        message_type,
+                    });
+                }
             }
-            cursor_server::RESET => {
-                require_empty(message.body, "cursor reset body")?;
-                let next_epoch = state
-                    .cursor_epoch
-                    .checked_add(1)
-                    .ok_or_else(|| resource_limit_error("cursor epoch"))?;
-                state = CursorState {
-                    connection_generation,
-                    channel_id,
-                    cursor_epoch: next_epoch,
-                    ..CursorState::default()
-                };
-                cache.clear();
-                awaiting_init = true;
-            }
-            cursor_server::SET => {
-                let update = CursorSet::decode(message.body)?;
-                state.position = update.position;
-                state.visible = update.visible;
-                state.shape = resolve_image(update.image, &mut cache, &budget)?;
-            }
-            cursor_server::MOVE => {
-                state.position = decode_cursor_position(message.body)?;
-                state.visible = true;
-            }
-            cursor_server::HIDE => {
-                require_empty(message.body, "cursor hide body")?;
-                state.visible = false;
-            }
-            cursor_server::TRAIL => {
-                (state.trail_length, state.trail_frequency) = decode_cursor_trail(message.body)?;
-            }
-            cursor_server::INVALIDATE_ONE => {
-                cache.remove(decode_cursor_cache_id(message.body)?);
-            }
-            cursor_server::INVALIDATE_ALL => {
-                require_empty(message.body, "cursor invalidate all body")?;
-                cache.clear();
-            }
-            message_type => {
-                return Err(ClientError::UnsupportedMessage {
-                    channel: "cursor",
-                    message_type,
-                });
-            }
+            state_sender.send_replace(Some(state.clone()));
         }
-        state_sender.send_replace(Some(state.clone()));
+        if counts_for_ack {
+            control.acknowledge_envelope(&mut channel).await?;
+        }
         progress.complete(identity, serial)?;
     }
 }

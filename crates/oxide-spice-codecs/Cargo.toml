@@ -5,15 +5,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["audio-opus", "video-h264", "video-h265", "video-vpx"]
+audio-opus = ["dep:opus"]
+video-h264 = ["dep:openh264"]
+video-h265 = ["dep:rust_h265"]
+video-vpx = ["dep:vpx-rs"]
+
 [dependencies]
 miniz_oxide.workspace = true
 jpeg-decoder.workspace = true
 lz4_flex.workspace = true
-openh264.workspace = true
-opus.workspace = true
-rust_h265.workspace = true
+openh264 = { workspace = true, optional = true }
+opus = { workspace = true, optional = true }
+rust_h265 = { workspace = true, optional = true }
 thiserror.workspace = true
-vpx-rs.workspace = true
+vpx-rs = { workspace = true, optional = true }
 zune-jpeg.workspace = true
 
 [dev-dependencies]

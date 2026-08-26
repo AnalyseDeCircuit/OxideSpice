@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::ClientError;
 use crate::channel::{
-    Channel, ChannelIdentity, ControlDisposition, ControlState, IncomingMessage, ProgressRegistry,
+    Channel, ChannelIdentity, ControlDisposition, ControlState, IncomingEnvelope, ProgressRegistry,
     handle_channel_wait,
 };
 
@@ -186,7 +186,8 @@ where
             }
             incoming = channel.read_message(&mut message_body) => {
                 let header = incoming?;
-                let message = IncomingMessage { header, body: &message_body };
+                let envelope = IncomingEnvelope::decode(header, &message_body)?;
+                let counts_for_ack = envelope.counts_for_ack();
                 let serial = channel.received_serial();
                 if let Some(seamless) =
                     channel.observe_migration_activation(&mut observed_migration_activation)
@@ -201,32 +202,37 @@ where
                         transport_generation,
                     });
                 }
-                if control.handle(&mut channel, &message).await? == ControlDisposition::Consumed {
-                    progress.complete(identity, serial)?;
-                    continue;
-                }
-                if handle_channel_wait(&progress, identity, serial, &mut cancel, &message).await? {
-                    progress.complete(identity, serial)?;
-                    continue;
-                }
-                if message.header.message_type != smartcard_server::DATA {
-                    return Err(ClientError::UnsupportedMessage {
-                        channel: "smartcard",
-                        message_type: message.header.message_type,
-                    });
-                }
-                let decoded = SmartcardMessage::decode(message.body)?;
-                let inbound = SmartcardInbound {
-                    transport_generation,
-                    message_type: decoded.message_type,
-                    reader_id: decoded.reader_id,
-                    data: Arc::from(decoded.data),
-                };
-                match paths.inbound.try_send(inbound) {
-                    Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        return Err(resource_limit_error("Smartcard message queue"));
+                for message in envelope.messages() {
+                    if control.handle_without_ack(&mut channel, &message).await?
+                        == ControlDisposition::Consumed
+                    {
+                        continue;
                     }
+                    if handle_channel_wait(&progress, identity, serial, &mut cancel, &message).await? {
+                        continue;
+                    }
+                    if message.header.message_type != smartcard_server::DATA {
+                        return Err(ClientError::UnsupportedMessage {
+                            channel: "smartcard",
+                            message_type: message.header.message_type,
+                        });
+                    }
+                    let decoded = SmartcardMessage::decode(message.body)?;
+                    let inbound = SmartcardInbound {
+                        transport_generation,
+                        message_type: decoded.message_type,
+                        reader_id: decoded.reader_id,
+                        data: Arc::from(decoded.data),
+                    };
+                    match paths.inbound.try_send(inbound) {
+                        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            return Err(resource_limit_error("Smartcard message queue"));
+                        }
+                    }
+                }
+                if counts_for_ack {
+                    control.acknowledge_envelope(&mut channel).await?;
                 }
                 progress.complete(identity, serial)?;
             }

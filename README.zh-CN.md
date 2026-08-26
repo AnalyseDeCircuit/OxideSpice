@@ -15,6 +15,9 @@ OxideSpice 使用 [Apache-2.0](LICENSE) 许可证。
 - 支持 TCP、Unix 域套接字、Ticket 认证、SASL 和由调用方配置的 rustls TLS。
 - 管理 Main、Display、Cursor、Inputs、Agent、Playback、Record、Port、WebDAV、
   USBredir 和 Smartcard 通道。
+- 支持经典 Display Canvas 命令集，包括 Fill、Opaque、Copy/Blend、Blackness、Whiteness、
+  Invers、ROP3、Stroke、光栅 Text、Transparent 和 Alpha Blend；clip、mask、brush、缩放、
+  path 与 glyph 均采用有界处理。
 - 支持原始与索引位图、Composite/A8、LZ、GLZ、zlib-GLZ、LZ4、JPEG、JPEG-alpha、
   QUIC、MJPEG、VP8、H.264、VP9 和 H.265 显示路径。
 - 支持多显示器、多选择区和多种二进制格式的剪贴板、Agent 文件传输、音频状态以及
@@ -45,7 +48,7 @@ SPICE 字节协议始终由 Rust 代码管理。部分生产级编解码、光�
 
 | 边界 | 依赖方式 |
 | --- | --- |
-| Composite/A8 | 通过 `pixman-sys` 和 `pkg-config` 动态使用系统 pixman。 |
+| Draw Composite | 通过 `pixman-sys` 和 `pkg-config` 动态使用系统 pixman。 |
 | TLS | 启用 `tls-ring` 时由 `ring` 编译随包提供的 C 和汇编代码。 |
 | SASL GSSAPI | 通过 `libgssapi-sys` 使用系统 Kerberos/GSSAPI。 |
 | Opus | 通过 `opusic-sys` 和 CMake 编译随包提供、采用 BSD 许可证的 libopus。 |
@@ -65,6 +68,17 @@ SPICE 字节协议始终由 Rust 代码管理。部分生产级编解码、光�
 - 构建对应 crate 时，需要 pixman、libvpx、Kerberos/GSSAPI、usbredir/libusb 和 PC/SC
   开发包。
 
+`oxide-spice-client` 默认启用 `composite-pixman`、`audio-opus`、`sasl-gssapi`、
+`video-h264`、`video-h265` 和 `video-vpx`，每个边界都可以独立关闭。关闭全部默认功能
+后，Rust 字节协议栈、基于密码的 SASL、经典 Canvas、图像编解码、原始音频和 MJPEG
+仍然可用，同时不链接 pixman、GSSAPI、libopus、OpenH264、libvpx 或 H.265 decoder。
+
+`oxide-spice-helper` 会转发这些客户端功能开关，并分别用 `tls-ring`、`usbredir`、
+`smartcard` 和 `webdav` 控制宿主集成。默认构建启用完整 helper；使用
+`--no-default-features` 时，稳定的标准输入输出协议和核心会话路径仍然保留，但不引入
+可选传输安全、媒体、光栅、设备和文件系统后端。宿主若请求未编译的集成，会收到明确
+的运行时错误。
+
 协议 crate 不需要上述原生软件包，可以独立构建：
 
 ```sh
@@ -75,6 +89,12 @@ cargo build -p oxide-spice-protocol
 
 ```sh
 cargo build --workspace --all-features
+```
+
+构建依赖最少的 helper：
+
+```sh
+cargo build -p oxide-spice-helper --no-default-features
 ```
 
 ## 客户端快速开始
@@ -144,6 +164,20 @@ cargo check --workspace --all-targets --all-features
 ```sh
 cargo test --workspace --all-features
 ```
+
+检查不带可选光栅和媒体 backend 的客户端：
+
+```sh
+cargo check -p oxide-spice-client --no-default-features --all-targets
+```
+
+安装 `cargo-fuzz` 与 LLVM/libFuzzer 后，可对有界 wire parser 执行：
+
+```sh
+cargo fuzz run protocol_boundaries
+```
+
+`libfuzzer-sys` 仅存在于独立 `fuzz` workspace，不属于库或发布依赖。
 
 需要复现 QEMU 环境时，请参考[受控互操作流程](docs/qemu-interoperability.zh-CN.md)。
 

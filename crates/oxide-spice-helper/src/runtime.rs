@@ -1,21 +1,25 @@
 //! Helper-owned session lifecycle and public client API adaptation.
 
 use std::collections::HashMap;
+#[cfg(feature = "tls-ring")]
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(feature = "tls-ring")]
 use oxide_spice_client::tls::pki_types::CertificateDer;
+#[cfg(feature = "tls-ring")]
 use oxide_spice_client::tls::{ClientConfig, RootCertStore};
 use oxide_spice_client::{
     AgentClipboardSelection, AgentEvent, AgentEvents, AgentFeatures, AgentHandle, AgentSendError,
     AgentState, ClientError, ConnectOptions, CursorEvents, DisplayTopologyEvents, ErrorCategory,
     FileTransferMetadata, FileTransferState, GuestMonitor, GuestMonitorLayout, InputSendError,
-    InputsHandle, KeyboardModifiers, MigrationTlsConfiguration, MigrationTlsPolicy, MouseButton,
-    MouseButtons, PlaybackAudioSettings, PlaybackPackets, PlaybackState, PointerPosition,
-    PortChannel, PortInbound, PortState, RecordAudioSettings, RecordChannel, RecordState,
-    SaslCredentials, SaslOptions, Session, SmartcardChannel, TicketSecret, TransportSecurity,
-    UsbRedirChannel,
+    InputsHandle, KeyboardModifiers, MouseButton, MouseButtons, PlaybackAudioSettings,
+    PlaybackPackets, PlaybackState, PointerPosition, PortChannel, PortInbound, PortState,
+    RecordAudioSettings, RecordChannel, RecordState, SaslCredentials, SaslOptions, Session,
+    SmartcardChannel, TicketSecret, TransportSecurity, UsbRedirChannel,
 };
+#[cfg(feature = "tls-ring")]
+use oxide_spice_client::{MigrationTlsConfiguration, MigrationTlsPolicy};
 use oxide_spice_protocol::{AgentClipboardType, ChannelType, Rect};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -31,12 +35,17 @@ use crate::ipc::{
     HelperSasl, HelperStatus, HelperTopologyMonitor, HelperTransportSecurity,
     HelperUsbDeviceIdentity,
 };
+#[cfg(feature = "smartcard")]
 use crate::smartcard::{list_pcsc_readers, run_smartcard_redirection};
+#[cfg(feature = "usbredir")]
 use crate::usbredir::{UsbDeviceIdentity, list_usb_devices, run_usb_redirection};
+#[cfg(feature = "webdav")]
 use crate::webdav::{WebDavConfig, run_webdav};
 
 const RECORD_STATE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+#[cfg(feature = "tls-ring")]
 const MAX_TLS_ROOT_CERTIFICATES: usize = 64;
+#[cfg(feature = "tls-ring")]
 const MAX_TLS_ROOT_CERTIFICATE_BYTES: usize = 1024 * 1024;
 const MAX_NATIVE_INTEGRATION_TASKS: usize = 64;
 const MAX_HELPER_FILE_TRANSFERS: usize = 8;
@@ -109,10 +118,12 @@ enum HelperPortCommand {
 }
 
 #[derive(Debug)]
+#[cfg(feature = "tls-ring")]
 struct HostnameMigrationTlsPolicy {
     client_config: Arc<ClientConfig>,
 }
 
+#[cfg(feature = "tls-ring")]
 impl MigrationTlsPolicy for HostnameMigrationTlsPolicy {
     fn configure(
         &self,
@@ -358,35 +369,46 @@ fn build_connect_options(
             server_name,
             root_certificates_der,
         } => {
-            if root_certificates_der.is_empty()
-                || root_certificates_der.len() > MAX_TLS_ROOT_CERTIFICATES
+            #[cfg(not(feature = "tls-ring"))]
             {
+                let _ = (server_name, root_certificates_der);
                 return Err(HelperRuntimeError::Configuration(
-                    "TLS requires a bounded non-empty root certificate list".to_owned(),
+                    "TLS is disabled in this helper build".to_owned(),
                 ));
             }
-            let mut roots = RootCertStore::empty();
-            for certificate in root_certificates_der {
-                if certificate.is_empty() || certificate.len() > MAX_TLS_ROOT_CERTIFICATE_BYTES {
+            #[cfg(feature = "tls-ring")]
+            {
+                if root_certificates_der.is_empty()
+                    || root_certificates_der.len() > MAX_TLS_ROOT_CERTIFICATES
+                {
                     return Err(HelperRuntimeError::Configuration(
-                        "TLS root certificate exceeds its size bound".to_owned(),
+                        "TLS requires a bounded non-empty root certificate list".to_owned(),
                     ));
                 }
-                roots.add(CertificateDer::from(certificate)).map_err(|_| {
-                    HelperRuntimeError::Configuration("invalid TLS root certificate".to_owned())
-                })?;
-            }
-            let client_config = Arc::new(
-                ClientConfig::builder()
-                    .with_root_certificates(roots)
-                    .with_no_client_auth(),
-            );
-            connect_options.migration_tls_policy = Some(Arc::new(HostnameMigrationTlsPolicy {
-                client_config: client_config.clone(),
-            }));
-            TransportSecurity::Tls {
-                server_name,
-                client_config,
+                let mut roots = RootCertStore::empty();
+                for certificate in root_certificates_der {
+                    if certificate.is_empty() || certificate.len() > MAX_TLS_ROOT_CERTIFICATE_BYTES
+                    {
+                        return Err(HelperRuntimeError::Configuration(
+                            "TLS root certificate exceeds its size bound".to_owned(),
+                        ));
+                    }
+                    roots.add(CertificateDer::from(certificate)).map_err(|_| {
+                        HelperRuntimeError::Configuration("invalid TLS root certificate".to_owned())
+                    })?;
+                }
+                let client_config = Arc::new(
+                    ClientConfig::builder()
+                        .with_root_certificates(roots)
+                        .with_no_client_auth(),
+                );
+                connect_options.migration_tls_policy = Some(Arc::new(HostnameMigrationTlsPolicy {
+                    client_config: client_config.clone(),
+                }));
+                TransportSecurity::Tls {
+                    server_name,
+                    client_config,
+                }
             }
         }
     };
@@ -497,6 +519,7 @@ fn take_session_resources(mut session: Session) -> SessionResources {
     }
 }
 
+#[cfg(feature = "webdav")]
 fn start_webdav_integration(
     resources: &mut SessionResources,
     channel_id: u8,
@@ -521,6 +544,16 @@ fn start_webdav_integration(
         }
     });
     Ok(())
+}
+
+#[cfg(not(feature = "webdav"))]
+fn start_webdav_integration(
+    _resources: &mut SessionResources,
+    _channel_id: u8,
+    _root: std::path::PathBuf,
+    _read_only: bool,
+) -> Result<(), String> {
+    Err("WebDAV support is disabled in this helper build".to_owned())
 }
 
 fn start_generic_port_bridges(resources: &mut SessionResources, events: EventSender) {
@@ -669,6 +702,7 @@ fn send_port_command(
     })
 }
 
+#[cfg(feature = "usbredir")]
 fn start_usb_integration(
     resources: &mut SessionResources,
     channel_id: u8,
@@ -703,6 +737,16 @@ fn start_usb_integration(
     Ok(())
 }
 
+#[cfg(not(feature = "usbredir"))]
+fn start_usb_integration(
+    _resources: &mut SessionResources,
+    _channel_id: u8,
+    _device: HelperUsbDeviceIdentity,
+) -> Result<(), String> {
+    Err("USB redirection support is disabled in this helper build".to_owned())
+}
+
+#[cfg(feature = "smartcard")]
 fn start_smartcard_integration(
     resources: &mut SessionResources,
     channel_id: u8,
@@ -738,6 +782,15 @@ fn start_smartcard_integration(
         }
     });
     Ok(())
+}
+
+#[cfg(not(feature = "smartcard"))]
+fn start_smartcard_integration(
+    _resources: &mut SessionResources,
+    _channel_id: u8,
+    _display_name: String,
+) -> Result<(), String> {
+    Err("Smartcard redirection support is disabled in this helper build".to_owned())
 }
 
 fn ensure_integration_task_capacity(resources: &SessionResources) -> Result<(), String> {
@@ -1238,31 +1291,12 @@ fn start_native_device_discovery(
     ensure_integration_task_capacity(resources)?;
     resources.integration_tasks.spawn(async move {
         let result = async {
-            let (usb_devices, smartcard_readers) = tokio::join!(
-                tokio::task::spawn_blocking(list_usb_devices),
-                tokio::task::spawn_blocking(list_pcsc_readers),
-            );
-            let usb_devices = usb_devices
-                .map_err(|_| "USB device discovery panicked".to_owned())?
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .map(|device| HelperUsbDeviceIdentity {
-                    bus_number: device.bus_number,
-                    device_address: device.device_address,
-                    vendor_id: device.vendor_id,
-                    product_id: device.product_id,
-                })
-                .collect();
-            let smartcard_readers = smartcard_readers
-                .map_err(|_| "PC/SC reader discovery panicked".to_owned())?
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .map(|reader| reader.display_name())
-                .collect();
+            let (usb_devices, smartcard_readers) =
+                tokio::join!(discover_usb_devices(), discover_smartcard_readers());
             events
                 .send_control(HelperEvent::NativeDevices {
-                    usb_devices,
-                    smartcard_readers,
+                    usb_devices: usb_devices?,
+                    smartcard_readers: smartcard_readers?,
                 })
                 .map_err(|error| error.to_string())
         }
@@ -1273,6 +1307,49 @@ fn start_native_device_discovery(
         }
     });
     Ok(())
+}
+
+#[cfg(feature = "usbredir")]
+async fn discover_usb_devices() -> Result<Vec<HelperUsbDeviceIdentity>, String> {
+    tokio::task::spawn_blocking(list_usb_devices)
+        .await
+        .map_err(|_| "USB device discovery panicked".to_owned())?
+        .map_err(|error| error.to_string())
+        .map(|devices| {
+            devices
+                .into_iter()
+                .map(|device| HelperUsbDeviceIdentity {
+                    bus_number: device.bus_number,
+                    device_address: device.device_address,
+                    vendor_id: device.vendor_id,
+                    product_id: device.product_id,
+                })
+                .collect()
+        })
+}
+
+#[cfg(not(feature = "usbredir"))]
+async fn discover_usb_devices() -> Result<Vec<HelperUsbDeviceIdentity>, String> {
+    Ok(Vec::new())
+}
+
+#[cfg(feature = "smartcard")]
+async fn discover_smartcard_readers() -> Result<Vec<String>, String> {
+    tokio::task::spawn_blocking(list_pcsc_readers)
+        .await
+        .map_err(|_| "PC/SC reader discovery panicked".to_owned())?
+        .map_err(|error| error.to_string())
+        .map(|readers| {
+            readers
+                .into_iter()
+                .map(|reader| reader.display_name())
+                .collect()
+        })
+}
+
+#[cfg(not(feature = "smartcard"))]
+async fn discover_smartcard_readers() -> Result<Vec<String>, String> {
+    Ok(Vec::new())
 }
 
 fn with_inputs(

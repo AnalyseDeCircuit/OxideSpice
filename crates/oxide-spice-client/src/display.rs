@@ -1,4 +1,5 @@
 //! Display surface ownership and bounded frame notifications.
+mod canvas;
 
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -8,20 +9,24 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use oxide_spice_codecs::{
-    DecodeLimits, DecodedGlzImage, DecodedImage, DecodedJpeg, DecodedLz4Image, DecodedPixels,
-    DecodedQuicImage, DecodedVideoFrame, GlzErrorKind, LzImageType, SpiceVideoCodec,
-    SpiceVideoDecoder, decode_glz_with_cancel, decode_jpeg_with_cancel, decode_lz_with_cancel,
-    decode_lz4_with_cancel, decode_quic_with_cancel, inflate_zlib_exact_with_cancel,
+    DecodeLimits, DecodedGlzImage, DecodedImage, DecodedJpeg, DecodedPixels, DecodedVideoFrame,
+    GlzErrorKind, LzImageType, SpiceVideoCodec, SpiceVideoDecoder, decode_glz_with_cancel,
+    decode_jpeg_with_cancel, decode_lz_with_cancel, decode_lz4_with_cancel,
+    decode_quic_with_cancel, inflate_zlib_exact_with_cancel,
 };
 use oxide_spice_protocol::{
-    BitmapFormat, BitmapPalette, BitmapUpdate, CompositeClip, CompositeImage, CompositeTransform,
-    CompressedImageUpdate, CopyBits, DisplayInit, DrawComposite, DrawCopyImageType, EmbeddedImage,
-    GlDraw, GlScanout2Unix, GlScanoutUnix, ImageCompression, JpegUpdate, MonitorHead,
-    MonitorsConfig, Rect, SolidFill, StreamClip, StreamClipUpdate, StreamCreate, StreamData,
-    StreamReport, StreamReportActivation, SurfaceCreate, SurfaceFormat, VideoCodec,
-    WaitForChannels, common_server, display_capability, display_client, display_server,
-    encode_preferred_video_codecs,
+    BitmapFormat, BitmapPalette, CompositeClip, CompositeImage, CompressedImageUpdate, CopyBits,
+    DisplayBrush, DisplayInit, DisplayMask, DrawAlphaBlend, DrawCopy as ClassicDrawCopy,
+    DrawCopyImageType, DrawFill as ClassicDrawFill, DrawMaskedDestination, DrawOpaque, DrawRop3,
+    DrawStroke, DrawText, DrawTransparent, EmbeddedImage, GlDraw, GlScanout2Unix, GlScanoutUnix,
+    ImageCompression, InvalidateList, MonitorHead, MonitorsConfig, Rect, StreamClip,
+    StreamClipUpdate, StreamCreate, StreamData, StreamReport, StreamReportActivation,
+    SurfaceCreate, SurfaceFormat, VideoCodec, WaitForChannels, common_server, display_capability,
+    display_client, display_server, encode_preferred_video_codecs,
 };
+#[cfg(feature = "composite-pixman")]
+use oxide_spice_protocol::{CompositeTransform, DrawComposite};
+#[cfg(feature = "composite-pixman")]
 use pixman::{
     Box32 as PixmanBox32, Filter as PixmanFilter, Fixed as PixmanFixed, FormatCode as PixmanFormat,
     Image as PixmanImage, Operation as PixmanOperation, Region32 as PixmanRegion32,
@@ -32,12 +37,10 @@ use tokio::sync::{RwLock, Semaphore, mpsc, oneshot, watch, watch::error::RecvErr
 
 use crate::ClientError;
 use crate::channel::{
-    Channel, ChannelIdentity, ControlDisposition, ControlState, IncomingMessage, ProgressRegistry,
+    Channel, ChannelIdentity, ControlDisposition, ControlState, IncomingEnvelope, ProgressRegistry,
     handle_channel_wait,
 };
 
-/// Required raster operation for direct source replacement.
-const RASTER_OPERATION_PUT: u16 = 1 << 3;
 /// A bounded default for all live surface backing stores in one Display task.
 const DEFAULT_MAX_SURFACE_BYTES: usize = 256 * 1024 * 1024;
 /// Maximum number of full image decodes that may allocate concurrently in one session.
@@ -53,14 +56,20 @@ const MAX_PALETTE_CACHE_ENTRIES: usize = 256;
 const MAX_PALETTE_CACHE_BYTES: usize = 256 * 1024;
 /// Maximum independently decoded video streams retained by one Display channel.
 const MAX_ACTIVE_STREAMS: usize = 16;
-/// Preference order favors broadly accelerated inter-frame codecs over intra-only MJPEG.
-const PREFERRED_VIDEO_CODECS: [VideoCodec; 5] = [
-    VideoCodec::H264,
-    VideoCodec::Vp9,
-    VideoCodec::H265,
-    VideoCodec::Vp8,
-    VideoCodec::Mjpeg,
-];
+/// Builds the preference order from codecs that are present in this binary.
+fn preferred_video_codecs() -> Vec<VideoCodec> {
+    let mut codecs = Vec::with_capacity(5);
+    #[cfg(feature = "video-h264")]
+    codecs.push(VideoCodec::H264);
+    #[cfg(feature = "video-vpx")]
+    codecs.push(VideoCodec::Vp9);
+    #[cfg(feature = "video-h265")]
+    codecs.push(VideoCodec::H265);
+    #[cfg(feature = "video-vpx")]
+    codecs.push(VideoCodec::Vp8);
+    codecs.push(VideoCodec::Mjpeg);
+    codecs
+}
 
 /// Host-facing pixel layout stored by the first Display implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -749,287 +758,6 @@ impl SurfaceData {
         })
     }
 
-    /// Applies a solid fill without allocating temporary pixel storage.
-    fn fill(&mut self, fill: SolidFill) -> Result<(), ClientError> {
-        if fill.rop_descriptor != RASTER_OPERATION_PUT {
-            return Err(unsupported_wire("fill raster operation"));
-        }
-        let bounds = self.rect_bounds(fill.destination)?;
-        let bgrx = fill.color_bgrx.to_le_bytes();
-        let rgba = if self.format == SurfaceFormat::A8 {
-            [u8::MAX, u8::MAX, u8::MAX, bgrx[0]]
-        } else {
-            [bgrx[2], bgrx[1], bgrx[0], u8::MAX]
-        };
-        for row in bounds.y..bounds.y + bounds.height {
-            let row_start = self.pixel_offset(bounds.x, row)?;
-            let row_end = row_start
-                .checked_add(bounds.width * 4)
-                .ok_or_else(|| resource_limit_error("fill row"))?;
-            for pixel in self.pixel_bytes_mut()[row_start..row_end].chunks_exact_mut(4) {
-                pixel.copy_from_slice(&rgba);
-            }
-        }
-        Ok(())
-    }
-
-    /// Applies a checked raw bitmap region and converts BGR wire pixels to RGBA in place.
-    fn blit_bitmap(
-        &mut self,
-        update: &BitmapUpdate<'_>,
-        palette: Option<&[[u8; 4]]>,
-    ) -> Result<(), ClientError> {
-        let surface_format = self.format;
-        if update.rop_descriptor != RASTER_OPERATION_PUT {
-            return Err(unsupported_wire("bitmap raster operation"));
-        }
-        let destination = self.rect_bounds(update.destination)?;
-        let source = image_rect_bounds(update.source, update.image_width, update.image_height)?;
-        if destination.width != source.width || destination.height != source.height {
-            return Err(unsupported_wire("scaled bitmap update"));
-        }
-        let stride =
-            usize::try_from(update.stride).map_err(|_| resource_limit_error("bitmap stride"))?;
-        for row in 0..source.height {
-            let logical_source_y = source.y + row;
-            let storage_source_y = if update.top_down {
-                logical_source_y
-            } else {
-                usize::try_from(update.image_height)
-                    .map_err(|_| resource_limit_error("bitmap height"))?
-                    .checked_sub(logical_source_y + 1)
-                    .ok_or_else(|| protocol_value_error("bitmap row orientation"))?
-            };
-            let row_start = storage_source_y
-                .checked_mul(stride)
-                .ok_or_else(|| resource_limit_error("bitmap row offset"))?;
-            let source_end = row_start
-                .checked_add(stride)
-                .ok_or_else(|| resource_limit_error("bitmap row length"))?;
-            let source_row = update
-                .pixel_bytes
-                .get(row_start..source_end)
-                .ok_or_else(|| protocol_value_error("bitmap row bounds"))?;
-            let destination_start = self.pixel_offset(destination.x, destination.y + row)?;
-            let destination_end = destination_start
-                .checked_add(destination.width * 4)
-                .ok_or_else(|| resource_limit_error("surface row length"))?;
-            let destination_row = &mut self.pixel_bytes_mut()[destination_start..destination_end];
-            if let Some(source_bytes_per_pixel) = update.format.bytes_per_pixel() {
-                let source_x_bytes = source
-                    .x
-                    .checked_mul(source_bytes_per_pixel)
-                    .ok_or_else(|| resource_limit_error("bitmap source x"))?;
-                let selected_bytes = source
-                    .width
-                    .checked_mul(source_bytes_per_pixel)
-                    .ok_or_else(|| resource_limit_error("bitmap selected row"))?;
-                let selected_end = source_x_bytes
-                    .checked_add(selected_bytes)
-                    .ok_or_else(|| resource_limit_error("bitmap selected row"))?;
-                let selected = source_row
-                    .get(source_x_bytes..selected_end)
-                    .ok_or_else(|| protocol_value_error("bitmap selected row bounds"))?;
-                for (source_pixel, destination_pixel) in selected
-                    .chunks_exact(source_bytes_per_pixel)
-                    .zip(destination_row.chunks_exact_mut(4))
-                {
-                    let rgba = direct_color_to_rgba(update.format, source_pixel, surface_format)?;
-                    write_surface_pixel(surface_format, destination_pixel, &rgba);
-                }
-            } else {
-                let palette = palette.ok_or_else(|| protocol_value_error("missing palette"))?;
-                for (column, destination_pixel) in destination_row.chunks_exact_mut(4).enumerate() {
-                    let index =
-                        indexed_palette_index(update.format, source_row, source.x + column)?;
-                    let color = palette
-                        .get(index)
-                        .ok_or_else(|| protocol_value_error("palette index"))?;
-                    write_surface_pixel(surface_format, destination_pixel, color);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Applies one fully decoded top-down LZ image without copying the complete surface.
-    fn blit_lz(
-        &mut self,
-        update: &CompressedImageUpdate<'_>,
-        image: &DecodedImage,
-    ) -> Result<(), ClientError> {
-        let surface_format = self.format;
-        if update.rop_descriptor != RASTER_OPERATION_PUT {
-            return Err(unsupported_wire("LZ raster operation"));
-        }
-        if image.width != update.image_width || image.height != update.image_height {
-            return Err(protocol_value_error("LZ and image descriptor dimensions"));
-        }
-        let source = image_rect_bounds(update.source, image.width, image.height)?;
-        let destination = self.rect_bounds(update.destination)?;
-        if destination.width != source.width || destination.height != source.height {
-            return Err(unsupported_wire("scaled LZ update"));
-        }
-        if let DecodedPixels::Alpha8(alpha) = &image.pixels {
-            if self.format != SurfaceFormat::A8 {
-                return Err(unsupported_wire("alpha-only LZ destination"));
-            }
-            let image_width = usize::try_from(image.width)
-                .map_err(|_| resource_limit_error("LZ alpha image width"))?;
-            for row in 0..source.height {
-                let source_start = (source.y + row)
-                    .checked_mul(image_width)
-                    .and_then(|pixels| pixels.checked_add(source.x))
-                    .ok_or_else(|| resource_limit_error("LZ alpha source row"))?;
-                let source_row = alpha
-                    .get(source_start..source_start + source.width)
-                    .ok_or_else(|| protocol_value_error("LZ alpha row bounds"))?;
-                let destination_start = self.pixel_offset(destination.x, destination.y + row)?;
-                let destination_row = &mut self.pixel_bytes_mut()
-                    [destination_start..destination_start + destination.width * 4];
-                for (alpha, destination_pixel) in
-                    source_row.iter().zip(destination_row.chunks_exact_mut(4))
-                {
-                    destination_pixel.copy_from_slice(&[u8::MAX, u8::MAX, u8::MAX, *alpha]);
-                }
-            }
-            return Ok(());
-        }
-        let DecodedPixels::Rgba(pixels) = &image.pixels else {
-            unreachable!("alpha plane returned above")
-        };
-        let image_width =
-            usize::try_from(image.width).map_err(|_| resource_limit_error("LZ image width"))?;
-        for row in 0..source.height {
-            let source_start = (source.y + row)
-                .checked_mul(image_width)
-                .and_then(|pixels| pixels.checked_add(source.x))
-                .and_then(|pixels| pixels.checked_mul(4))
-                .ok_or_else(|| resource_limit_error("LZ source row"))?;
-            let row_bytes = source
-                .width
-                .checked_mul(4)
-                .ok_or_else(|| resource_limit_error("LZ row bytes"))?;
-            let source_row = pixels
-                .get(source_start..source_start + row_bytes)
-                .ok_or_else(|| protocol_value_error("LZ source row bounds"))?;
-            let destination_start = self.pixel_offset(destination.x, destination.y + row)?;
-            let destination_row = &mut self.pixel_bytes_mut()
-                [destination_start..destination_start + destination.width * 4];
-            for (source_pixel, destination_pixel) in source_row
-                .chunks_exact(4)
-                .zip(destination_row.chunks_exact_mut(4))
-            {
-                write_surface_pixel(surface_format, destination_pixel, source_pixel);
-            }
-        }
-        Ok(())
-    }
-
-    /// Applies one decoded SPICE LZ4 image while preserving its row orientation.
-    fn blit_lz4(
-        &mut self,
-        update: &CompressedImageUpdate<'_>,
-        image: &DecodedLz4Image,
-    ) -> Result<(), ClientError> {
-        let surface_format = self.format;
-        if update.rop_descriptor != RASTER_OPERATION_PUT {
-            return Err(unsupported_wire("LZ4 raster operation"));
-        }
-        if image.width != update.image_width || image.height != update.image_height {
-            return Err(protocol_value_error("LZ4 and image descriptor dimensions"));
-        }
-        let source = image_rect_bounds(update.source, image.width, image.height)?;
-        let destination = self.rect_bounds(update.destination)?;
-        if destination.width != source.width || destination.height != source.height {
-            return Err(unsupported_wire("scaled LZ4 update"));
-        }
-        let image_width =
-            usize::try_from(image.width).map_err(|_| resource_limit_error("LZ4 image width"))?;
-        let image_height =
-            usize::try_from(image.height).map_err(|_| resource_limit_error("LZ4 image height"))?;
-        let row_bytes = source
-            .width
-            .checked_mul(4)
-            .ok_or_else(|| resource_limit_error("LZ4 row bytes"))?;
-        for row in 0..source.height {
-            let logical_y = source.y + row;
-            let storage_y = if image.top_down {
-                logical_y
-            } else {
-                image_height
-                    .checked_sub(logical_y + 1)
-                    .ok_or_else(|| protocol_value_error("LZ4 row orientation"))?
-            };
-            let source_start = storage_y
-                .checked_mul(image_width)
-                .and_then(|pixels| pixels.checked_add(source.x))
-                .and_then(|pixels| pixels.checked_mul(4))
-                .ok_or_else(|| resource_limit_error("LZ4 source row"))?;
-            let source_row = image
-                .pixels
-                .get(source_start..source_start + row_bytes)
-                .ok_or_else(|| protocol_value_error("LZ4 source row bounds"))?;
-            let destination_start = self.pixel_offset(destination.x, destination.y + row)?;
-            let destination_row =
-                &mut self.pixel_bytes_mut()[destination_start..destination_start + row_bytes];
-            for (source_pixel, destination_pixel) in source_row
-                .chunks_exact(4)
-                .zip(destination_row.chunks_exact_mut(4))
-            {
-                write_surface_pixel(surface_format, destination_pixel, source_pixel);
-            }
-        }
-        Ok(())
-    }
-
-    /// Applies one decoded top-down JPEG image without an additional frame-sized copy.
-    fn blit_jpeg(
-        &mut self,
-        update: &JpegUpdate<'_>,
-        image: &DecodedJpeg,
-    ) -> Result<(), ClientError> {
-        let surface_format = self.format;
-        if update.rop_descriptor != RASTER_OPERATION_PUT {
-            return Err(unsupported_wire("JPEG raster operation"));
-        }
-        if image.width != update.image_width || image.height != update.image_height {
-            return Err(protocol_value_error("JPEG and image descriptor dimensions"));
-        }
-        let source = image_rect_bounds(update.source, image.width, image.height)?;
-        let destination = self.rect_bounds(update.destination)?;
-        if destination.width != source.width || destination.height != source.height {
-            return Err(unsupported_wire("scaled JPEG update"));
-        }
-        let image_width =
-            usize::try_from(image.width).map_err(|_| resource_limit_error("JPEG image width"))?;
-        let row_bytes = source
-            .width
-            .checked_mul(4)
-            .ok_or_else(|| resource_limit_error("JPEG row bytes"))?;
-        for row in 0..source.height {
-            let source_start = (source.y + row)
-                .checked_mul(image_width)
-                .and_then(|pixels| pixels.checked_add(source.x))
-                .and_then(|pixels| pixels.checked_mul(4))
-                .ok_or_else(|| resource_limit_error("JPEG source row"))?;
-            let source_row = image
-                .pixels
-                .get(source_start..source_start + row_bytes)
-                .ok_or_else(|| protocol_value_error("JPEG source row bounds"))?;
-            let destination_start = self.pixel_offset(destination.x, destination.y + row)?;
-            let destination_row =
-                &mut self.pixel_bytes_mut()[destination_start..destination_start + row_bytes];
-            for (source_pixel, destination_pixel) in source_row
-                .chunks_exact(4)
-                .zip(destination_row.chunks_exact_mut(4))
-            {
-                write_surface_pixel(surface_format, destination_pixel, source_pixel);
-            }
-        }
-        Ok(())
-    }
-
     /// Scales one decoded stream frame into its destination while preserving pixels outside clip.
     fn blit_stream_frame(
         &mut self,
@@ -1080,107 +808,8 @@ impl SurfaceData {
         Ok(())
     }
 
-    /// Applies one decoded top-down QUIC image without an additional frame-sized copy.
-    fn blit_quic(
-        &mut self,
-        update: &CompressedImageUpdate<'_>,
-        image: &DecodedQuicImage,
-    ) -> Result<(), ClientError> {
-        let surface_format = self.format;
-        if update.rop_descriptor != RASTER_OPERATION_PUT {
-            return Err(unsupported_wire("QUIC raster operation"));
-        }
-        if image.width != update.image_width || image.height != update.image_height {
-            return Err(protocol_value_error("QUIC and image descriptor dimensions"));
-        }
-        let source = image_rect_bounds(update.source, image.width, image.height)?;
-        let destination = self.rect_bounds(update.destination)?;
-        if destination.width != source.width || destination.height != source.height {
-            return Err(unsupported_wire("scaled QUIC update"));
-        }
-        let image_width =
-            usize::try_from(image.width).map_err(|_| resource_limit_error("QUIC image width"))?;
-        let row_bytes = source
-            .width
-            .checked_mul(4)
-            .ok_or_else(|| resource_limit_error("QUIC row bytes"))?;
-        for row in 0..source.height {
-            let source_start = (source.y + row)
-                .checked_mul(image_width)
-                .and_then(|pixels| pixels.checked_add(source.x))
-                .ok_or_else(|| resource_limit_error("QUIC source row"))?;
-            let source_row = image
-                .pixels
-                .get(source_start..source_start + source.width)
-                .ok_or_else(|| protocol_value_error("QUIC source row bounds"))?;
-            let destination_start = self.pixel_offset(destination.x, destination.y + row)?;
-            let destination_row =
-                &mut self.pixel_bytes_mut()[destination_start..destination_start + row_bytes];
-            for (source_pixel, destination_pixel) in
-                source_row.iter().zip(destination_row.chunks_exact_mut(4))
-            {
-                write_surface_pixel(surface_format, destination_pixel, source_pixel);
-            }
-        }
-        Ok(())
-    }
-
-    /// Applies stream-order GLZ pixels while preserving their dictionary orientation.
-    fn blit_glz(
-        &mut self,
-        update: &CompressedImageUpdate<'_>,
-        image: &DecodedGlzImage,
-    ) -> Result<(), ClientError> {
-        let surface_format = self.format;
-        if update.rop_descriptor != RASTER_OPERATION_PUT {
-            return Err(unsupported_wire("GLZ raster operation"));
-        }
-        if image.width != update.image_width || image.height != update.image_height {
-            return Err(protocol_value_error("GLZ and image descriptor dimensions"));
-        }
-        let source = image_rect_bounds(update.source, image.width, image.height)?;
-        let destination = self.rect_bounds(update.destination)?;
-        if destination.width != source.width || destination.height != source.height {
-            return Err(unsupported_wire("scaled GLZ update"));
-        }
-        let image_width =
-            usize::try_from(image.width).map_err(|_| resource_limit_error("GLZ image width"))?;
-        let image_height =
-            usize::try_from(image.height).map_err(|_| resource_limit_error("GLZ image height"))?;
-        for row in 0..source.height {
-            let logical_y = source.y + row;
-            let storage_y = if image.top_down {
-                logical_y
-            } else {
-                image_height
-                    .checked_sub(logical_y + 1)
-                    .ok_or_else(|| protocol_value_error("GLZ row orientation"))?
-            };
-            let source_start = storage_y
-                .checked_mul(image_width)
-                .and_then(|pixels| pixels.checked_add(source.x))
-                .and_then(|pixels| pixels.checked_mul(4))
-                .ok_or_else(|| resource_limit_error("GLZ source row"))?;
-            let row_bytes = source.width * 4;
-            let source_row = image
-                .pixels
-                .get(source_start..source_start + row_bytes)
-                .ok_or_else(|| protocol_value_error("GLZ source row bounds"))?;
-            let destination_start = self.pixel_offset(destination.x, destination.y + row)?;
-            let destination_row =
-                &mut self.pixel_bytes_mut()[destination_start..destination_start + row_bytes];
-            for (source_pixel, destination_pixel) in source_row
-                .chunks_exact(4)
-                .zip(destination_row.chunks_exact_mut(4))
-            {
-                write_surface_pixel(surface_format, destination_pixel, source_pixel);
-            }
-        }
-        Ok(())
-    }
-
-    /// Moves an existing same-surface region with overlap-safe row ordering.
-    fn copy_bits(&mut self, copy: CopyBits) -> Result<(), ClientError> {
+    /// Moves an existing same-surface region while honoring the inline Display clip.
+    fn copy_bits(&mut self, copy: &CopyBits) -> Result<(), ClientError> {
         let destination = self.rect_bounds(copy.destination)?;
         let source_rect = Rect {
             top: copy.source_y,
@@ -1201,6 +830,33 @@ impl SurfaceData {
                 .ok_or_else(|| resource_limit_error("copy bits right"))?,
         };
         let source = self.rect_bounds(source_rect)?;
+        if !matches!(copy.clip, CompositeClip::None) {
+            let surface_width = usize::try_from(self.width)
+                .map_err(|_| resource_limit_error("copy bits surface width"))?;
+            let pixel_count = source
+                .width
+                .checked_mul(source.height)
+                .ok_or_else(|| resource_limit_error("copy bits source pixels"))?;
+            let mut source_pixels = Vec::with_capacity(pixel_count);
+            for row in 0..source.height {
+                let start = (source.y + row)
+                    .checked_mul(surface_width)
+                    .and_then(|pixels| pixels.checked_add(source.x))
+                    .ok_or_else(|| resource_limit_error("copy bits source row"))?;
+                source_pixels.extend_from_slice(&self.pixels[start..start + source.width]);
+            }
+            for row in 0..destination.height {
+                for column in 0..destination.width {
+                    let x = destination.x + column;
+                    let y = destination.y + row;
+                    if canvas::clip_contains(&copy.clip, x, y)? {
+                        self.pixels[y * surface_width + x] =
+                            source_pixels[row * source.width + column];
+                    }
+                }
+            }
+            return Ok(());
+        }
         if destination.y > source.y {
             for row in (0..destination.height).rev() {
                 self.copy_surface_row(&source, &destination, row)?;
@@ -1230,8 +886,7 @@ impl SurfaceData {
 
     /// Converts a signed protocol rectangle into checked surface coordinates.
     fn rect_bounds(&self, rect: Rect) -> Result<Bounds, ClientError> {
-        let bounds = image_rect_bounds(rect, self.width, self.height)?;
-        Ok(bounds)
+        image_rect_bounds(rect, self.width, self.height)
     }
 
     /// Computes one RGBA byte offset with checked arithmetic.
@@ -1244,7 +899,6 @@ impl SurfaceData {
             .ok_or_else(|| resource_limit_error("surface pixel offset"))
     }
 }
-
 /// Converts one validated direct-color wire pixel to the shared RGBA surface format.
 fn direct_color_to_rgba(
     format: BitmapFormat,
@@ -1299,6 +953,61 @@ struct OwnedCompositePixels {
     width: u32,
     height: u32,
     pixels: Vec<u32>,
+}
+
+/// Prepares the optional image owned by one classic pattern brush.
+async fn prepare_classic_brush(
+    body: &[u8],
+    brush: DisplayBrush,
+    palette_cache: &mut PaletteCache,
+    image_decode_slots: &Arc<Semaphore>,
+    glz_window: &Arc<GlzWindow>,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<Option<PreparedCompositeImage>, ClientError> {
+    let DisplayBrush::Pattern { image, .. } = brush else {
+        return Ok(None);
+    };
+    prepare_composite_image(
+        body,
+        image,
+        palette_cache,
+        image_decode_slots,
+        glz_window,
+        cancel,
+    )
+    .await
+    .map(Some)
+}
+
+/// Prepares the optional A1 or surface image referenced by a classic QMask.
+async fn prepare_classic_mask(
+    body: &[u8],
+    mask: DisplayMask,
+    palette_cache: &mut PaletteCache,
+    image_decode_slots: &Arc<Semaphore>,
+    glz_window: &Arc<GlzWindow>,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<Option<PreparedCompositeImage>, ClientError> {
+    let Some(image) = mask.image else {
+        return Ok(None);
+    };
+    if matches!(
+        image,
+        CompositeImage::Embedded(descriptor)
+            if descriptor.image_type != DrawCopyImageType::Bitmap
+    ) {
+        return Err(unsupported_wire("compressed Canvas mask image"));
+    }
+    prepare_composite_image(
+        body,
+        image,
+        palette_cache,
+        image_decode_slots,
+        glz_window,
+        cancel,
+    )
+    .await
+    .map(Some)
 }
 
 /// Decodes one embedded Composite image under the same bounds and cancellation paths as Draw Copy.
@@ -1440,7 +1149,8 @@ async fn prepare_composite_image(
         }
         EmbeddedImage::Compressed(compressed) => {
             let palette = palette_cache.resolve(compressed.palette)?;
-            let decode_slot = acquire_image_decode_slot(image_decode_slots, cancel).await?;
+            let mut decode_slot =
+                Some(acquire_image_decode_slot(image_decode_slots, cancel).await?);
             let compressed_bytes = Arc::<[u8]>::from(compressed.compressed_bytes);
             let width = compressed.width;
             let height = compressed.height;
@@ -1539,7 +1249,11 @@ async fn prepare_composite_image(
                                 let image_id = error.missing_image_id.ok_or(
                                     ClientError::Internal("Composite GLZ reference identity"),
                                 )?;
+                                drop(decode_slot.take());
                                 glz_window.wait_for(image_id, cancel).await?;
+                                decode_slot = Some(
+                                    acquire_image_decode_slot(image_decode_slots, cancel).await?,
+                                );
                             }
                             Err(error) => return Err(error.into()),
                         }
@@ -1652,6 +1366,7 @@ fn rgba_bytes_into_words(bytes: Vec<u8>) -> Vec<u32> {
 }
 
 /// Applies one Composite operation while copying only inputs that alias the destination.
+#[cfg(feature = "composite-pixman")]
 async fn composite_surface_inputs(
     surfaces: &HashMap<u32, SurfaceHandle>,
     composite: &DrawComposite,
@@ -1783,6 +1498,7 @@ async fn composite_surface_inputs(
     Ok(destination_handle)
 }
 
+#[cfg(feature = "composite-pixman")]
 async fn composite_prepared(
     surfaces: &HashMap<u32, SurfaceHandle>,
     composite: &DrawComposite,
@@ -1929,9 +1645,11 @@ async fn composite_prepared(
     Ok(destination_handle)
 }
 
+#[cfg(feature = "composite-pixman")]
 type CompositeSurfacePixels<'a> = (SurfaceFormat, u32, u32, &'a mut [u32]);
 
 /// Maps SPICE Composite semantics onto pixman without copying independent surfaces.
+#[cfg(feature = "composite-pixman")]
 fn render_composite(
     destination: &mut SurfaceData,
     composite: &DrawComposite,
@@ -2069,6 +1787,7 @@ fn render_composite(
     Ok(())
 }
 
+#[cfg(feature = "composite-pixman")]
 fn configure_composite_image(
     image: &mut PixmanImage<'_, '_>,
     filter: u8,
@@ -2089,6 +1808,7 @@ fn configure_composite_image(
     Ok(())
 }
 
+#[cfg(feature = "composite-pixman")]
 fn pixman_transform(transform: CompositeTransform) -> PixmanTransform {
     PixmanTransform::new([
         [
@@ -2106,6 +1826,7 @@ fn pixman_transform(transform: CompositeTransform) -> PixmanTransform {
 }
 
 #[cfg(target_endian = "little")]
+#[cfg(feature = "composite-pixman")]
 fn pixman_surface_format(_format: SurfaceFormat, opaque: bool) -> PixmanFormat {
     if opaque {
         PixmanFormat::X8B8G8R8
@@ -2115,6 +1836,7 @@ fn pixman_surface_format(_format: SurfaceFormat, opaque: bool) -> PixmanFormat {
 }
 
 #[cfg(target_endian = "big")]
+#[cfg(feature = "composite-pixman")]
 fn pixman_surface_format(_format: SurfaceFormat, opaque: bool) -> PixmanFormat {
     if opaque {
         PixmanFormat::R8G8B8X8
@@ -2123,6 +1845,7 @@ fn pixman_surface_format(_format: SurfaceFormat, opaque: bool) -> PixmanFormat {
     }
 }
 
+#[cfg(feature = "composite-pixman")]
 fn pixman_filter(filter: u8) -> Result<PixmanFilter, ClientError> {
     match filter {
         0 => Ok(PixmanFilter::Fast),
@@ -2136,6 +1859,7 @@ fn pixman_filter(filter: u8) -> Result<PixmanFilter, ClientError> {
     }
 }
 
+#[cfg(feature = "composite-pixman")]
 fn pixman_repeat(repeat: u8) -> Result<PixmanRepeat, ClientError> {
     match repeat {
         0 => Ok(PixmanRepeat::None),
@@ -2146,6 +1870,7 @@ fn pixman_repeat(repeat: u8) -> Result<PixmanRepeat, ClientError> {
     }
 }
 
+#[cfg(feature = "composite-pixman")]
 fn pixman_operation(operation: u8) -> Result<PixmanOperation, ClientError> {
     let operation = match operation {
         0x00 => PixmanOperation::Clear,
@@ -2206,6 +1931,7 @@ fn pixman_operation(operation: u8) -> Result<PixmanOperation, ClientError> {
     Ok(operation)
 }
 
+#[cfg(feature = "composite-pixman")]
 fn normalize_surface_region(surface: &mut SurfaceData, bounds: Bounds) {
     if surface.format == SurfaceFormat::Argb32 {
         return;
@@ -2266,6 +1992,7 @@ impl Drop for SurfaceData {
 }
 
 /// Checked unsigned rectangle used only after validating signed wire coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Bounds {
     x: usize,
     y: usize,
@@ -2316,7 +2043,7 @@ where
         channel
             .write_message(
                 display_client::PREFERRED_VIDEO_CODEC,
-                &encode_preferred_video_codecs(&PREFERRED_VIDEO_CODECS)?,
+                &encode_preferred_video_codecs(&preferred_video_codecs())?,
             )
             .await?;
     }
@@ -2371,10 +2098,8 @@ where
             }
             message = channel.read_message(&mut message_body) => message?,
         };
-        let message = IncomingMessage {
-            header,
-            body: &message_body,
-        };
+        let envelope = IncomingEnvelope::decode(header, &message_body)?;
+        let counts_for_ack = envelope.counts_for_ack();
         let serial = channel.received_serial();
         if let Some(seamless) =
             channel.observe_migration_activation(&mut observed_migration_activation)
@@ -2394,737 +2119,745 @@ where
                 gl_scanout = None;
             }
         }
-        if control.handle(&mut channel, &message).await? == ControlDisposition::Consumed {
-            progress.complete(identity, serial)?;
-            continue;
-        }
-        if handle_channel_wait(&progress, identity, serial, &mut cancel, &message).await? {
-            progress.complete(identity, serial)?;
-            continue;
-        }
-        match message.header.message_type {
-            display_server::MODE => {
-                if message.body.len() != 12 {
-                    return Err(protocol_value_error("display mode body"));
-                }
+        for message in envelope.messages() {
+            if control.handle_without_ack(&mut channel, &message).await?
+                == ControlDisposition::Consumed
+            {
+                continue;
             }
-            display_server::MARK => {
-                if !message.body.is_empty() {
-                    return Err(protocol_value_error("empty Display control body"));
-                }
+            if handle_channel_wait(&progress, identity, serial, &mut cancel, &message).await? {
+                continue;
             }
-            display_server::INVALIDATE_ALL_PIXMAPS => {
-                let waits = WaitForChannels::decode(message.body)?;
-                progress
-                    .wait_for(identity, serial, &waits, &mut cancel)
-                    .await?;
-            }
-            display_server::INVALIDATE_PALETTE => {
-                if message.body.len() != 8 {
-                    return Err(protocol_value_error("palette invalidation body"));
-                }
-                let unique_id =
-                    u64::from_le_bytes(message.body.try_into().expect("validated palette id body"));
-                palette_cache.invalidate(unique_id);
-            }
-            display_server::INVALIDATE_ALL_PALETTES => {
-                if !message.body.is_empty() {
-                    return Err(protocol_value_error("palette invalidation body"));
-                }
-                palette_cache.clear();
-            }
-            display_server::RESET => {
-                if !message.body.is_empty() {
-                    return Err(protocol_value_error("Display Reset body"));
-                }
-                surfaces.clear();
-                streams.clear();
-                frame_sender.send_replace(None);
-                topology_sender.send_replace(None);
-                palette_cache.clear();
-                graphics_epoch = graphics_epoch
-                    .checked_add(1)
-                    .ok_or_else(|| resource_limit_error("graphics epoch"))?;
-                #[cfg(unix)]
-                {
-                    gl_scanout = None;
-                }
-            }
-            display_server::SURFACE_CREATE => {
-                let create = SurfaceCreate::decode(message.body)?;
-                if surfaces.contains_key(&create.surface_id) {
-                    return Err(protocol_value_error("duplicate surface id"));
-                }
-                let surface = SurfaceData::new(create, surface_budget.clone())?;
-                surfaces.insert(
-                    create.surface_id,
-                    SurfaceHandle {
-                        display_channel_id,
-                        surface_id: create.surface_id,
-                        width: create.width,
-                        height: create.height,
-                        is_primary: create.flags & SURFACE_FLAG_PRIMARY != 0,
-                        inner: Arc::new(RwLock::new(surface)),
-                    },
-                );
-            }
-            display_server::SURFACE_DESTROY => {
-                if message.body.len() != 4 {
-                    return Err(protocol_value_error("surface destroy body"));
-                }
-                let surface_id =
-                    u32::from_le_bytes(message.body[..4].try_into().expect("validated fixed body"));
-                if surfaces
-                    .remove(&surface_id)
-                    .is_some_and(|surface| surface.is_primary)
-                {
-                    frame_sender.send_replace(None);
-                }
-                streams.retain(|_, stream| stream.create.surface_id != surface_id);
-            }
-            display_server::MONITORS_CONFIG => {
-                let config = MonitorsConfig::decode(message.body)?;
-                for monitor in &config.heads {
-                    let surface = surfaces.get(&monitor.surface_id).ok_or_else(|| {
-                        protocol_value_error("monitor references unknown surface")
-                    })?;
-                    let right = monitor
-                        .x
-                        .checked_add(monitor.width)
-                        .ok_or_else(|| protocol_value_error("monitor right edge"))?;
-                    let bottom = monitor
-                        .y
-                        .checked_add(monitor.height)
-                        .ok_or_else(|| protocol_value_error("monitor bottom edge"))?;
-                    if right > surface.width || bottom > surface.height {
-                        return Err(protocol_value_error("monitor exceeds surface bounds"));
+            match message.header.message_type {
+                display_server::MODE => {
+                    if message.body.len() != 12 {
+                        return Err(protocol_value_error("display mode body"));
                     }
                 }
-                topology_sender.send_replace(Some(DisplayTopology {
-                    connection_generation,
-                    graphics_epoch,
-                    display_channel_id,
-                    maximum_allowed: config.maximum_allowed,
-                    monitors: config.heads.into(),
-                }));
-            }
-            display_server::STREAM_CREATE => {
-                let create = StreamCreate::decode(message.body)?;
-                if streams.contains_key(&create.stream_id) {
-                    return Err(protocol_value_error("duplicate Display stream id"));
-                }
-                if streams.len() == MAX_ACTIVE_STREAMS {
-                    return Err(resource_limit_error("active Display streams"));
-                }
-                let surface = surface_for_update(&surfaces, create.surface_id)?;
-                surface.inner.read().await.rect_bounds(create.destination)?;
-                let decoder_codec = match create.codec {
-                    VideoCodec::Mjpeg => SpiceVideoCodec::Mjpeg,
-                    VideoCodec::Vp8 => SpiceVideoCodec::Vp8,
-                    VideoCodec::H264 => SpiceVideoCodec::H264,
-                    VideoCodec::Vp9 => SpiceVideoCodec::Vp9,
-                    VideoCodec::H265 => SpiceVideoCodec::H265,
-                };
-                let decoder = VideoDecoderWorker::start(
-                    decoder_codec,
-                    create.stream_width,
-                    create.stream_height,
-                )
-                .await?;
-                streams.insert(
-                    create.stream_id,
-                    StreamRuntime {
-                        create,
-                        decoder,
-                        report: None,
-                    },
-                );
-            }
-            display_server::STREAM_CLIP => {
-                let update = StreamClipUpdate::decode(message.body)?;
-                let stream = streams
-                    .get_mut(&update.stream_id)
-                    .ok_or_else(|| protocol_value_error("unknown Display stream clip id"))?;
-                stream.create.clip = update.clip;
-            }
-            display_server::STREAM_DESTROY => {
-                if message.body.len() != 4 {
-                    return Err(protocol_value_error("Display stream destroy body"));
-                }
-                let stream_id =
-                    u32::from_le_bytes(message.body.try_into().expect("validated stream id"));
-                if streams.remove(&stream_id).is_none() {
-                    return Err(protocol_value_error("unknown Display stream destroy id"));
-                }
-            }
-            display_server::STREAM_DESTROY_ALL => {
-                if !message.body.is_empty() {
-                    return Err(protocol_value_error("Display stream destroy-all body"));
-                }
-                streams.clear();
-            }
-            display_server::STREAM_ACTIVATE_REPORT => {
-                let activation = StreamReportActivation::decode(message.body)?;
-                let stream = streams
-                    .get_mut(&activation.stream_id)
-                    .ok_or_else(|| protocol_value_error("unknown Display stream report id"))?;
-                stream.report = Some(StreamReportState {
-                    unique_id: activation.unique_id,
-                    maximum_window_frames: activation.maximum_window_frames,
-                    timeout: Duration::from_millis(u64::from(activation.timeout_ms)),
-                    window_started: Instant::now(),
-                    start_frame_multimedia_time: None,
-                    end_frame_multimedia_time: 0,
-                    frame_count: 0,
-                });
-            }
-            display_server::STREAM_DATA | display_server::STREAM_DATA_SIZED => {
-                let frame = StreamData::decode(
-                    message.body,
-                    message.header.message_type == display_server::STREAM_DATA_SIZED,
-                )?;
-                let create = streams
-                    .get(&frame.stream_id)
-                    .ok_or_else(|| protocol_value_error("unknown Display stream data id"))?
-                    .create
-                    .clone();
-                let frame_width = frame.width.unwrap_or(create.stream_width);
-                let frame_height = frame.height.unwrap_or(create.stream_height);
-                let destination = frame.destination.unwrap_or(create.destination);
-                let stream = streams
-                    .get(&frame.stream_id)
-                    .ok_or_else(|| protocol_value_error("unknown Display stream data id"))?;
-                let compressed = Arc::<[u8]>::from(frame.data);
-                let image = tokio::select! {
-                    changed = cancel.changed() => {
-                        if changed.is_err() || *cancel.borrow() {
-                            let _ = channel.shutdown().await;
-                            return Ok(());
-                        }
-                        continue;
+                display_server::MARK => {
+                    if !message.body.is_empty() {
+                        return Err(protocol_value_error("empty Display control body"));
                     }
-                    decoded = stream.decoder.decode(compressed, frame_width, frame_height) => decoded,
-                }?;
-                if let Some(image) = image {
-                    let surface = surface_for_update(&surfaces, create.surface_id)?;
-                    surface.inner.write().await.blit_stream_frame(
-                        destination,
-                        &create.clip,
-                        &image,
-                    )?;
-                    notify_surface(
-                        &frame_sender,
-                        connection_generation,
-                        graphics_epoch,
-                        create.surface_id,
-                        destination,
-                        surface,
-                    );
                 }
-
-                let report = streams
-                    .get_mut(&frame.stream_id)
-                    .and_then(|stream| stream.report.as_mut())
-                    .and_then(|report| {
-                        report
-                            .start_frame_multimedia_time
-                            .get_or_insert(frame.multimedia_time);
-                        report.end_frame_multimedia_time = frame.multimedia_time;
-                        report.frame_count = report.frame_count.saturating_add(1);
-                        if report.frame_count < report.maximum_window_frames
-                            && report.window_started.elapsed() < report.timeout
-                        {
-                            return None;
-                        }
-                        let completed = StreamReport {
-                            stream_id: frame.stream_id,
-                            unique_id: report.unique_id,
-                            start_frame_multimedia_time: report
-                                .start_frame_multimedia_time
-                                .unwrap_or(frame.multimedia_time),
-                            end_frame_multimedia_time: report.end_frame_multimedia_time,
-                            frame_count: report.frame_count,
-                            dropped_frame_count: 0,
-                            last_frame_delay_ms: 0,
-                            audio_delay_ms: u32::MAX,
-                        };
-                        report.window_started = Instant::now();
-                        report.start_frame_multimedia_time = None;
-                        report.frame_count = 0;
-                        Some(completed)
-                    });
-                if let Some(report) = report {
-                    channel
-                        .write_message(display_client::STREAM_REPORT, &report.encode())
+                display_server::INVALIDATE_LIST => {
+                    let _ = InvalidateList::decode(message.body)?;
+                }
+                display_server::INVALIDATE_ALL_PIXMAPS => {
+                    let waits = WaitForChannels::decode(message.body)?;
+                    progress
+                        .wait_for(identity, serial, &waits, &mut cancel)
                         .await?;
                 }
-            }
-            display_server::DRAW_FILL => {
-                let fill = SolidFill::decode(message.body)?;
-                let surface = surface_for_update(&surfaces, fill.surface_id)?;
-                surface.inner.write().await.fill(fill)?;
-                notify_surface(
-                    &frame_sender,
-                    connection_generation,
-                    graphics_epoch,
-                    fill.surface_id,
-                    fill.destination,
-                    surface,
-                );
-            }
-            display_server::DRAW_COPY => match DrawCopyImageType::decode(message.body)? {
-                DrawCopyImageType::Bitmap => {
-                    let update = BitmapUpdate::decode_draw_copy(
-                        message.body,
-                        BitmapUpdate::DEFAULT_MAX_BITMAP_BYTES,
-                    )?;
-                    let palette = palette_cache.resolve(update.palette)?;
-                    let surface = surface_for_update(&surfaces, update.surface_id)?;
-                    surface
-                        .inner
-                        .write()
-                        .await
-                        .blit_bitmap(&update, palette.as_deref())?;
-                    notify_surface(
-                        &frame_sender,
-                        connection_generation,
-                        graphics_epoch,
-                        update.surface_id,
-                        update.destination,
-                        surface,
+                display_server::INVALIDATE_PALETTE => {
+                    if message.body.len() != 8 {
+                        return Err(protocol_value_error("palette invalidation body"));
+                    }
+                    let unique_id = u64::from_le_bytes(
+                        message.body.try_into().expect("validated palette id body"),
+                    );
+                    palette_cache.invalidate(unique_id);
+                }
+                display_server::INVALIDATE_ALL_PALETTES => {
+                    if !message.body.is_empty() {
+                        return Err(protocol_value_error("palette invalidation body"));
+                    }
+                    palette_cache.clear();
+                }
+                display_server::RESET => {
+                    if !message.body.is_empty() {
+                        return Err(protocol_value_error("Display Reset body"));
+                    }
+                    surfaces.clear();
+                    streams.clear();
+                    frame_sender.send_replace(None);
+                    topology_sender.send_replace(None);
+                    palette_cache.clear();
+                    graphics_epoch = graphics_epoch
+                        .checked_add(1)
+                        .ok_or_else(|| resource_limit_error("graphics epoch"))?;
+                    #[cfg(unix)]
+                    {
+                        gl_scanout = None;
+                    }
+                }
+                display_server::SURFACE_CREATE => {
+                    let create = SurfaceCreate::decode(message.body)?;
+                    if surfaces.contains_key(&create.surface_id) {
+                        return Err(protocol_value_error("duplicate surface id"));
+                    }
+                    let surface = SurfaceData::new(create, surface_budget.clone())?;
+                    surfaces.insert(
+                        create.surface_id,
+                        SurfaceHandle {
+                            display_channel_id,
+                            surface_id: create.surface_id,
+                            width: create.width,
+                            height: create.height,
+                            is_primary: create.flags & SURFACE_FLAG_PRIMARY != 0,
+                            inner: Arc::new(RwLock::new(surface)),
+                        },
                     );
                 }
-                DrawCopyImageType::LzPalette | DrawCopyImageType::LzRgb => {
-                    let update = CompressedImageUpdate::decode_draw_copy(
-                        message.body,
-                        CompressedImageUpdate::DEFAULT_MAX_COMPRESSED_BYTES,
-                    )?;
-                    let palette = palette_cache.resolve(update.palette)?;
-                    let decode_slot = tokio::select! {
-                        changed = cancel.changed() => {
-                            if changed.is_err() || *cancel.borrow() {
-                                let _ = channel.shutdown().await;
-                                return Ok(());
-                            }
-                            image_decode_slots.clone().acquire_owned().await
-                        }
-                        slot = image_decode_slots.clone().acquire_owned() => slot,
+                display_server::SURFACE_DESTROY => {
+                    if message.body.len() != 4 {
+                        return Err(protocol_value_error("surface destroy body"));
                     }
-                    .map_err(|_| ClientError::Internal("image decode gate closed"))?;
-                    let compressed = update.compressed_bytes.to_vec();
-                    let decode_palette = palette.clone();
-                    let decode_cancel = cancel.clone();
-                    let image = tokio::task::spawn_blocking(move || {
-                        decode_lz_with_cancel(
-                            &compressed,
-                            decode_palette.as_deref(),
-                            DecodeLimits::DISPLAY,
-                            || *decode_cancel.borrow(),
-                        )
-                    })
-                    .await
-                    .map_err(|_| ClientError::Internal("LZ decode task panicked"))??;
-                    let surface = surface_for_update(&surfaces, update.surface_id)?;
-                    surface.inner.write().await.blit_lz(&update, &image)?;
-                    notify_surface(
-                        &frame_sender,
+                    let surface_id = u32::from_le_bytes(
+                        message.body[..4].try_into().expect("validated fixed body"),
+                    );
+                    if surfaces
+                        .remove(&surface_id)
+                        .is_some_and(|surface| surface.is_primary)
+                    {
+                        frame_sender.send_replace(None);
+                    }
+                    streams.retain(|_, stream| stream.create.surface_id != surface_id);
+                }
+                display_server::MONITORS_CONFIG => {
+                    let config = MonitorsConfig::decode(message.body)?;
+                    for monitor in &config.heads {
+                        let surface = surfaces.get(&monitor.surface_id).ok_or_else(|| {
+                            protocol_value_error("monitor references unknown surface")
+                        })?;
+                        let right = monitor
+                            .x
+                            .checked_add(monitor.width)
+                            .ok_or_else(|| protocol_value_error("monitor right edge"))?;
+                        let bottom = monitor
+                            .y
+                            .checked_add(monitor.height)
+                            .ok_or_else(|| protocol_value_error("monitor bottom edge"))?;
+                        if right > surface.width || bottom > surface.height {
+                            return Err(protocol_value_error("monitor exceeds surface bounds"));
+                        }
+                    }
+                    topology_sender.send_replace(Some(DisplayTopology {
                         connection_generation,
                         graphics_epoch,
-                        update.surface_id,
-                        update.destination,
-                        surface,
-                    );
-                    drop(decode_slot);
-                }
-                DrawCopyImageType::Lz4 => {
-                    let update = CompressedImageUpdate::decode_draw_copy(
-                        message.body,
-                        CompressedImageUpdate::DEFAULT_MAX_COMPRESSED_BYTES,
-                    )?;
-                    let decode_slot = tokio::select! {
-                        changed = cancel.changed() => {
-                            if changed.is_err() || *cancel.borrow() {
-                                let _ = channel.shutdown().await;
-                                return Ok(());
-                            }
-                            image_decode_slots.clone().acquire_owned().await
-                        }
-                        slot = image_decode_slots.clone().acquire_owned() => slot,
-                    }
-                    .map_err(|_| ClientError::Internal("image decode gate closed"))?;
-                    let compressed = update.compressed_bytes.to_vec();
-                    let decode_cancel = cancel.clone();
-                    let image_width = update.image_width;
-                    let image_height = update.image_height;
-                    let image = tokio::task::spawn_blocking(move || {
-                        decode_lz4_with_cancel(
-                            &compressed,
-                            image_width,
-                            image_height,
-                            DecodeLimits::DISPLAY,
-                            || *decode_cancel.borrow(),
-                        )
-                    })
-                    .await
-                    .map_err(|_| ClientError::Internal("LZ4 decode task panicked"))??;
-                    let surface = surface_for_update(&surfaces, update.surface_id)?;
-                    surface.inner.write().await.blit_lz4(&update, &image)?;
-                    notify_surface(
-                        &frame_sender,
-                        connection_generation,
-                        graphics_epoch,
-                        update.surface_id,
-                        update.destination,
-                        surface,
-                    );
-                    drop(decode_slot);
-                }
-                DrawCopyImageType::Quic => {
-                    let update = CompressedImageUpdate::decode_draw_copy(
-                        message.body,
-                        CompressedImageUpdate::DEFAULT_MAX_COMPRESSED_BYTES,
-                    )?;
-                    let decode_slot = tokio::select! {
-                        changed = cancel.changed() => {
-                            if changed.is_err() || *cancel.borrow() {
-                                let _ = channel.shutdown().await;
-                                return Ok(());
-                            }
-                            image_decode_slots.clone().acquire_owned().await
-                        }
-                        slot = image_decode_slots.clone().acquire_owned() => slot,
-                    }
-                    .map_err(|_| ClientError::Internal("image decode gate closed"))?;
-                    let compressed = update.compressed_bytes.to_vec();
-                    let decode_cancel = cancel.clone();
-                    let image_width = update.image_width;
-                    let image_height = update.image_height;
-                    let image = tokio::task::spawn_blocking(move || {
-                        decode_quic_with_cancel(
-                            &compressed,
-                            image_width,
-                            image_height,
-                            DecodeLimits::DISPLAY,
-                            || *decode_cancel.borrow(),
-                        )
-                    })
-                    .await
-                    .map_err(|_| ClientError::Internal("QUIC decode task panicked"))??;
-                    let surface = surface_for_update(&surfaces, update.surface_id)?;
-                    surface.inner.write().await.blit_quic(&update, &image)?;
-                    notify_surface(
-                        &frame_sender,
-                        connection_generation,
-                        graphics_epoch,
-                        update.surface_id,
-                        update.destination,
-                        surface,
-                    );
-                    drop(decode_slot);
-                }
-                DrawCopyImageType::Jpeg | DrawCopyImageType::JpegAlpha => {
-                    let update = JpegUpdate::decode_draw_copy(
-                        message.body,
-                        JpegUpdate::DEFAULT_MAX_COMPRESSED_BYTES,
-                    )?;
-                    let decode_slot = tokio::select! {
-                        changed = cancel.changed() => {
-                            if changed.is_err() || *cancel.borrow() {
-                                let _ = channel.shutdown().await;
-                                return Ok(());
-                            }
-                            image_decode_slots.clone().acquire_owned().await
-                        }
-                        slot = image_decode_slots.clone().acquire_owned() => slot,
-                    }
-                    .map_err(|_| ClientError::Internal("image decode gate closed"))?;
-                    let jpeg_bytes = update.jpeg_bytes.to_vec();
-                    let jpeg_cancel = cancel.clone();
-                    let image_width = update.image_width;
-                    let image_height = update.image_height;
-                    let mut image = tokio::task::spawn_blocking(move || {
-                        decode_jpeg_with_cancel(
-                            &jpeg_bytes,
-                            image_width,
-                            image_height,
-                            DecodeLimits::DISPLAY,
-                            move || *jpeg_cancel.borrow(),
-                        )
-                    })
-                    .await
-                    .map_err(|_| ClientError::Internal("JPEG decode task panicked"))??;
-                    if let Some(alpha_lz_bytes) = update.alpha_lz_bytes {
-                        let alpha_lz_bytes = alpha_lz_bytes.to_vec();
-                        let alpha_cancel = cancel.clone();
-                        let alpha = tokio::task::spawn_blocking(move || {
-                            decode_lz_with_cancel(
-                                &alpha_lz_bytes,
-                                None,
-                                DecodeLimits::DISPLAY,
-                                || *alpha_cancel.borrow(),
-                            )
-                        })
-                        .await
-                        .map_err(|_| ClientError::Internal("JPEG alpha decode task panicked"))??;
-                        attach_jpeg_alpha(
-                            &mut image,
-                            alpha,
-                            update
-                                .alpha_top_down
-                                .ok_or(ClientError::Internal("JPEG alpha orientation missing"))?,
-                        )?;
-                    }
-                    let surface = surface_for_update(&surfaces, update.surface_id)?;
-                    surface.inner.write().await.blit_jpeg(&update, &image)?;
-                    notify_surface(
-                        &frame_sender,
-                        connection_generation,
-                        graphics_epoch,
-                        update.surface_id,
-                        update.destination,
-                        surface,
-                    );
-                    drop(decode_slot);
-                }
-                DrawCopyImageType::GlzRgb | DrawCopyImageType::ZlibGlzRgb => {
-                    let update = CompressedImageUpdate::decode_draw_copy(
-                        message.body,
-                        CompressedImageUpdate::DEFAULT_MAX_COMPRESSED_BYTES,
-                    )?;
-                    let zlib_output_bytes = update.uncompressed_bytes;
-                    let mut compressed = None;
-                    let image = loop {
-                        let decode_slot = tokio::select! {
-                            changed = cancel.changed() => {
-                                if changed.is_err() || *cancel.borrow() {
-                                    let _ = channel.shutdown().await;
-                                    return Ok(());
-                                }
-                                image_decode_slots.clone().acquire_owned().await
-                            }
-                            slot = image_decode_slots.clone().acquire_owned() => slot,
-                        }
-                        .map_err(|_| ClientError::Internal("image decode gate closed"))?;
-                        let compressed = compressed
-                            .get_or_insert_with(|| Arc::<[u8]>::from(update.compressed_bytes))
-                            .clone();
-                        let glz_bytes = if let Some(expected_bytes) = zlib_output_bytes {
-                            let inflate_cancel = cancel.clone();
-                            tokio::task::spawn_blocking(move || {
-                                inflate_zlib_exact_with_cancel(
-                                    &compressed,
-                                    expected_bytes,
-                                    CompressedImageUpdate::DEFAULT_MAX_COMPRESSED_BYTES,
-                                    || *inflate_cancel.borrow(),
-                                )
-                            })
-                            .await
-                            .map_err(|_| ClientError::Internal("zlib decode task panicked"))??
-                            .into()
-                        } else {
-                            compressed
-                        };
-                        let decode_window = glz_window.clone();
-                        let decode_cancel = cancel.clone();
-                        let decoded = tokio::task::spawn_blocking(move || {
-                            decode_glz_with_cancel(
-                                &glz_bytes,
-                                DecodeLimits::DISPLAY,
-                                |image_id| decode_window.resolve(image_id),
-                                || *decode_cancel.borrow(),
-                            )
-                        })
-                        .await
-                        .map_err(|_| ClientError::Internal("GLZ decode task panicked"))?;
-                        drop(decode_slot);
-                        match decoded {
-                            Ok(image) => break image,
-                            Err(error) if error.kind == GlzErrorKind::MissingReference => {
-                                let missing_image_id = error.missing_image_id.ok_or(
-                                    ClientError::Internal("GLZ missing-reference identity"),
-                                )?;
-                                glz_window.wait_for(missing_image_id, &mut cancel).await?;
-                            }
-                            Err(error) => return Err(error.into()),
-                        }
-                    };
-                    glz_window.insert(&image)?;
-                    let surface = surface_for_update(&surfaces, update.surface_id)?;
-                    surface.inner.write().await.blit_glz(&update, &image)?;
-                    notify_surface(
-                        &frame_sender,
-                        connection_generation,
-                        graphics_epoch,
-                        update.surface_id,
-                        update.destination,
-                        surface,
-                    );
-                }
-            },
-            display_server::COPY_BITS => {
-                let copy = CopyBits::decode(message.body)?;
-                let surface = surface_for_update(&surfaces, copy.surface_id)?;
-                surface.inner.write().await.copy_bits(copy)?;
-                notify_surface(
-                    &frame_sender,
-                    connection_generation,
-                    graphics_epoch,
-                    copy.surface_id,
-                    copy.destination,
-                    surface,
-                );
-            }
-            display_server::DRAW_COMPOSITE => {
-                let composite = DrawComposite::decode(message.body)?;
-                let source = prepare_composite_image(
-                    message.body,
-                    composite.source,
-                    &mut palette_cache,
-                    &image_decode_slots,
-                    &glz_window,
-                    &mut cancel,
-                )
-                .await?;
-                let mask = match composite.mask {
-                    Some(mask) => Some(
-                        prepare_composite_image(
-                            message.body,
-                            mask,
-                            &mut palette_cache,
-                            &image_decode_slots,
-                            &glz_window,
-                            &mut cancel,
-                        )
-                        .await?,
-                    ),
-                    None => None,
-                };
-                let destination = composite_prepared(&surfaces, &composite, source, mask).await?;
-                notify_surface(
-                    &frame_sender,
-                    connection_generation,
-                    graphics_epoch,
-                    composite.destination_surface_id,
-                    composite.destination,
-                    destination,
-                );
-            }
-            #[cfg(unix)]
-            display_server::GL_SCANOUT_UNIX => {
-                let scanout = GlScanoutUnix::decode(message.body)?;
-                gl_scanout = if scanout.disabled() {
-                    None
-                } else {
-                    let file_descriptor = channel
-                        .take_received_file_descriptor()?
-                        .ok_or_else(|| protocol_value_error("missing GL scanout descriptor"))?;
-                    Some(Arc::new(DmaBufScanout {
-                        width: scanout.width,
-                        height: scanout.height,
-                        fourcc: scanout.fourcc,
-                        modifier: 0,
-                        top_down: scanout.top_down,
-                        planes: vec![DmaBufPlane {
-                            file_descriptor: Arc::new(file_descriptor),
-                            offset: 0,
-                            stride: scanout.stride,
-                        }]
-                        .into(),
-                    }))
-                };
-            }
-            #[cfg(unix)]
-            display_server::GL_SCANOUT2_UNIX => {
-                let scanout = GlScanout2Unix::decode(message.body)?;
-                if scanout.disabled() {
-                    gl_scanout = None;
-                } else {
-                    let mut planes = Vec::with_capacity(scanout.planes.len());
-                    for plane in scanout.planes {
-                        let file_descriptor =
-                            channel.take_received_file_descriptor()?.ok_or_else(|| {
-                                protocol_value_error("missing GL scanout2 descriptor")
-                            })?;
-                        planes.push(DmaBufPlane {
-                            file_descriptor: Arc::new(file_descriptor),
-                            offset: plane.offset,
-                            stride: plane.stride,
-                        });
-                    }
-                    gl_scanout = Some(Arc::new(DmaBufScanout {
-                        width: scanout.width,
-                        height: scanout.height,
-                        fourcc: scanout.fourcc,
-                        modifier: scanout.modifier,
-                        top_down: scanout.top_down,
-                        planes: planes.into(),
+                        display_channel_id,
+                        maximum_allowed: config.maximum_allowed,
+                        monitors: config.heads.into(),
                     }));
                 }
-            }
-            #[cfg(unix)]
-            display_server::GL_DRAW => {
-                let dirty = GlDraw::decode(message.body)?;
-                let scanout = gl_scanout
-                    .as_ref()
-                    .cloned()
-                    .ok_or_else(|| protocol_value_error("GL draw without scanout"))?;
-                if dirty
-                    .x
-                    .checked_add(dirty.width)
-                    .is_none_or(|right| right > scanout.width)
-                    || dirty
-                        .y
-                        .checked_add(dirty.height)
-                        .is_none_or(|bottom| bottom > scanout.height)
-                {
-                    return Err(protocol_value_error("GL draw outside scanout"));
-                }
-                let (completion, completed) = oneshot::channel();
-                let frame = GlFrame {
-                    connection_generation,
-                    display_channel_id,
-                    dirty,
-                    scanout,
-                    completion: Some(completion),
-                };
-                tokio::select! {
-                    changed = cancel.changed() => {
-                        if changed.is_err() || *cancel.borrow() {
-                            let _ = channel.shutdown().await;
-                            return Ok(());
-                        }
+                display_server::STREAM_CREATE => {
+                    let create = StreamCreate::decode(message.body)?;
+                    if streams.contains_key(&create.stream_id) {
+                        return Err(protocol_value_error("duplicate Display stream id"));
                     }
-                    sent = gl_frame_sender.send(frame) => {
-                        sent.map_err(|_| ClientError::TaskTerminated)?;
+                    if streams.len() == MAX_ACTIVE_STREAMS {
+                        return Err(resource_limit_error("active Display streams"));
                     }
-                }
-                tokio::select! {
-                    changed = cancel.changed() => {
-                        if changed.is_err() || *cancel.borrow() {
-                            let _ = channel.shutdown().await;
-                            return Ok(());
-                        }
-                    }
-                    result = completed => {
-                        result.map_err(|_| ClientError::TaskTerminated)?;
-                    }
-                }
-                channel
-                    .write_message(display_client::GL_DRAW_DONE, &[])
+                    let surface = surface_for_update(&surfaces, create.surface_id)?;
+                    surface.inner.read().await.rect_bounds(create.destination)?;
+                    let decoder_codec = match create.codec {
+                        VideoCodec::Mjpeg => SpiceVideoCodec::Mjpeg,
+                        VideoCodec::Vp8 => SpiceVideoCodec::Vp8,
+                        VideoCodec::H264 => SpiceVideoCodec::H264,
+                        VideoCodec::Vp9 => SpiceVideoCodec::Vp9,
+                        VideoCodec::H265 => SpiceVideoCodec::H265,
+                    };
+                    let decoder = VideoDecoderWorker::start(
+                        decoder_codec,
+                        create.stream_width,
+                        create.stream_height,
+                    )
                     .await?;
+                    streams.insert(
+                        create.stream_id,
+                        StreamRuntime {
+                            create,
+                            decoder,
+                            report: None,
+                        },
+                    );
+                }
+                display_server::STREAM_CLIP => {
+                    let update = StreamClipUpdate::decode(message.body)?;
+                    let stream = streams
+                        .get_mut(&update.stream_id)
+                        .ok_or_else(|| protocol_value_error("unknown Display stream clip id"))?;
+                    stream.create.clip = update.clip;
+                }
+                display_server::STREAM_DESTROY => {
+                    if message.body.len() != 4 {
+                        return Err(protocol_value_error("Display stream destroy body"));
+                    }
+                    let stream_id =
+                        u32::from_le_bytes(message.body.try_into().expect("validated stream id"));
+                    if streams.remove(&stream_id).is_none() {
+                        return Err(protocol_value_error("unknown Display stream destroy id"));
+                    }
+                }
+                display_server::STREAM_DESTROY_ALL => {
+                    if !message.body.is_empty() {
+                        return Err(protocol_value_error("Display stream destroy-all body"));
+                    }
+                    streams.clear();
+                }
+                display_server::STREAM_ACTIVATE_REPORT => {
+                    let activation = StreamReportActivation::decode(message.body)?;
+                    let stream = streams
+                        .get_mut(&activation.stream_id)
+                        .ok_or_else(|| protocol_value_error("unknown Display stream report id"))?;
+                    stream.report = Some(StreamReportState {
+                        unique_id: activation.unique_id,
+                        maximum_window_frames: activation.maximum_window_frames,
+                        timeout: Duration::from_millis(u64::from(activation.timeout_ms)),
+                        window_started: Instant::now(),
+                        start_frame_multimedia_time: None,
+                        end_frame_multimedia_time: 0,
+                        frame_count: 0,
+                    });
+                }
+                display_server::STREAM_DATA | display_server::STREAM_DATA_SIZED => {
+                    let frame = StreamData::decode(
+                        message.body,
+                        message.header.message_type == display_server::STREAM_DATA_SIZED,
+                    )?;
+                    let create = streams
+                        .get(&frame.stream_id)
+                        .ok_or_else(|| protocol_value_error("unknown Display stream data id"))?
+                        .create
+                        .clone();
+                    let frame_width = frame.width.unwrap_or(create.stream_width);
+                    let frame_height = frame.height.unwrap_or(create.stream_height);
+                    let destination = frame.destination.unwrap_or(create.destination);
+                    let stream = streams
+                        .get(&frame.stream_id)
+                        .ok_or_else(|| protocol_value_error("unknown Display stream data id"))?;
+                    let compressed = Arc::<[u8]>::from(frame.data);
+                    let image = tokio::select! {
+                        changed = cancel.changed() => {
+                            if changed.is_err() || *cancel.borrow() {
+                                let _ = channel.shutdown().await;
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        decoded = stream.decoder.decode(compressed, frame_width, frame_height) => decoded,
+                    }?;
+                    if let Some(image) = image {
+                        let surface = surface_for_update(&surfaces, create.surface_id)?;
+                        surface.inner.write().await.blit_stream_frame(
+                            destination,
+                            &create.clip,
+                            &image,
+                        )?;
+                        notify_surface(
+                            &frame_sender,
+                            connection_generation,
+                            graphics_epoch,
+                            create.surface_id,
+                            destination,
+                            surface,
+                        );
+                    }
+
+                    let report = streams
+                        .get_mut(&frame.stream_id)
+                        .and_then(|stream| stream.report.as_mut())
+                        .and_then(|report| {
+                            report
+                                .start_frame_multimedia_time
+                                .get_or_insert(frame.multimedia_time);
+                            report.end_frame_multimedia_time = frame.multimedia_time;
+                            report.frame_count = report.frame_count.saturating_add(1);
+                            if report.frame_count < report.maximum_window_frames
+                                && report.window_started.elapsed() < report.timeout
+                            {
+                                return None;
+                            }
+                            let completed = StreamReport {
+                                stream_id: frame.stream_id,
+                                unique_id: report.unique_id,
+                                start_frame_multimedia_time: report
+                                    .start_frame_multimedia_time
+                                    .unwrap_or(frame.multimedia_time),
+                                end_frame_multimedia_time: report.end_frame_multimedia_time,
+                                frame_count: report.frame_count,
+                                dropped_frame_count: 0,
+                                last_frame_delay_ms: 0,
+                                audio_delay_ms: u32::MAX,
+                            };
+                            report.window_started = Instant::now();
+                            report.start_frame_multimedia_time = None;
+                            report.frame_count = 0;
+                            Some(completed)
+                        });
+                    if let Some(report) = report {
+                        channel
+                            .write_message(display_client::STREAM_REPORT, &report.encode())
+                            .await?;
+                    }
+                }
+                display_server::DRAW_FILL => {
+                    let command = ClassicDrawFill::decode(message.body)?;
+                    let pattern = prepare_classic_brush(
+                        message.body,
+                        command.brush,
+                        &mut palette_cache,
+                        &image_decode_slots,
+                        &glz_window,
+                        &mut cancel,
+                    )
+                    .await?;
+                    let mask = prepare_classic_mask(
+                        message.body,
+                        command.mask,
+                        &mut palette_cache,
+                        &image_decode_slots,
+                        &glz_window,
+                        &mut cancel,
+                    )
+                    .await?;
+                    let surface =
+                        canvas::render_fill(&surfaces, &command, pattern.as_ref(), mask.as_ref())
+                            .await?;
+                    notify_surface(
+                        &frame_sender,
+                        connection_generation,
+                        graphics_epoch,
+                        command.base.surface_id,
+                        command.base.destination,
+                        surface,
+                    );
+                }
+                display_server::DRAW_OPAQUE => {
+                    let command = DrawOpaque::decode(message.body)?;
+                    let source = prepare_composite_image(
+                        message.body,
+                        command.source.image,
+                        &mut palette_cache,
+                        &image_decode_slots,
+                        &glz_window,
+                        &mut cancel,
+                    )
+                    .await?;
+                    let pattern = prepare_classic_brush(
+                        message.body,
+                        command.brush,
+                        &mut palette_cache,
+                        &image_decode_slots,
+                        &glz_window,
+                        &mut cancel,
+                    )
+                    .await?;
+                    let mask = prepare_classic_mask(
+                        message.body,
+                        command.mask,
+                        &mut palette_cache,
+                        &image_decode_slots,
+                        &glz_window,
+                        &mut cancel,
+                    )
+                    .await?;
+                    let surface = canvas::render_opaque(
+                        &surfaces,
+                        &command,
+                        &source,
+                        pattern.as_ref(),
+                        mask.as_ref(),
+                    )
+                    .await?;
+                    notify_surface(
+                        &frame_sender,
+                        connection_generation,
+                        graphics_epoch,
+                        command.base.surface_id,
+                        command.base.destination,
+                        surface,
+                    );
+                }
+                display_server::DRAW_COPY | display_server::DRAW_BLEND => {
+                    let command = ClassicDrawCopy::decode(message.body)?;
+                    let source = prepare_composite_image(
+                        message.body,
+                        command.source.image,
+                        &mut palette_cache,
+                        &image_decode_slots,
+                        &glz_window,
+                        &mut cancel,
+                    )
+                    .await?;
+                    let mask = prepare_classic_mask(
+                        message.body,
+                        command.mask,
+                        &mut palette_cache,
+                        &image_decode_slots,
+                        &glz_window,
+                        &mut cancel,
+                    )
+                    .await?;
+                    let surface =
+                        canvas::render_copy(&surfaces, &command, &source, mask.as_ref()).await?;
+                    notify_surface(
+                        &frame_sender,
+                        connection_generation,
+                        graphics_epoch,
+                        command.base.surface_id,
+                        command.base.destination,
+                        surface,
+                    );
+                }
+                display_server::DRAW_BLACKNESS
+                | display_server::DRAW_WHITENESS
+                | display_server::DRAW_INVERS => {
+                    let command = DrawMaskedDestination::decode(message.body)?;
+                    let mask = prepare_classic_mask(
+                        message.body,
+                        command.mask,
+                        &mut palette_cache,
+                        &image_decode_slots,
+                        &glz_window,
+                        &mut cancel,
+                    )
+                    .await?;
+                    let operation = match message.header.message_type {
+                        display_server::DRAW_BLACKNESS => {
+                            canvas::MaskedDestinationOperation::Blackness
+                        }
+                        display_server::DRAW_WHITENESS => {
+                            canvas::MaskedDestinationOperation::Whiteness
+                        }
+                        display_server::DRAW_INVERS => canvas::MaskedDestinationOperation::Invert,
+                        _ => unreachable!("classic destination operation was matched above"),
+                    };
+                    let surface = canvas::render_masked_destination(
+                        &surfaces,
+                        &command,
+                        mask.as_ref(),
+                        operation,
+                    )
+                    .await?;
+                    notify_surface(
+                        &frame_sender,
+                        connection_generation,
+                        graphics_epoch,
+                        command.base.surface_id,
+                        command.base.destination,
+                        surface,
+                    );
+                }
+                display_server::DRAW_ROP3 => {
+                    let command = DrawRop3::decode(message.body)?;
+                    let source = prepare_composite_image(
+                        message.body,
+                        command.source.image,
+                        &mut palette_cache,
+                        &image_decode_slots,
+                        &glz_window,
+                        &mut cancel,
+                    )
+                    .await?;
+                    let pattern = prepare_classic_brush(
+                        message.body,
+                        command.brush,
+                        &mut palette_cache,
+                        &image_decode_slots,
+                        &glz_window,
+                        &mut cancel,
+                    )
+                    .await?;
+                    let mask = prepare_classic_mask(
+                        message.body,
+                        command.mask,
+                        &mut palette_cache,
+                        &image_decode_slots,
+                        &glz_window,
+                        &mut cancel,
+                    )
+                    .await?;
+                    let surface = canvas::render_rop3(
+                        &surfaces,
+                        &command,
+                        &source,
+                        pattern.as_ref(),
+                        mask.as_ref(),
+                    )
+                    .await?;
+                    notify_surface(
+                        &frame_sender,
+                        connection_generation,
+                        graphics_epoch,
+                        command.base.surface_id,
+                        command.base.destination,
+                        surface,
+                    );
+                }
+                display_server::DRAW_STROKE => {
+                    let command = DrawStroke::decode(message.body)?;
+                    let pattern = prepare_classic_brush(
+                        message.body,
+                        command.brush,
+                        &mut palette_cache,
+                        &image_decode_slots,
+                        &glz_window,
+                        &mut cancel,
+                    )
+                    .await?;
+                    let surface =
+                        canvas::render_stroke(&surfaces, &command, pattern.as_ref()).await?;
+                    notify_surface(
+                        &frame_sender,
+                        connection_generation,
+                        graphics_epoch,
+                        command.base.surface_id,
+                        command.base.destination,
+                        surface,
+                    );
+                }
+                display_server::DRAW_TEXT => {
+                    let command = DrawText::decode(message.body)?;
+                    let foreground_pattern = prepare_classic_brush(
+                        message.body,
+                        command.foreground_brush,
+                        &mut palette_cache,
+                        &image_decode_slots,
+                        &glz_window,
+                        &mut cancel,
+                    )
+                    .await?;
+                    let background_pattern = prepare_classic_brush(
+                        message.body,
+                        command.background_brush,
+                        &mut palette_cache,
+                        &image_decode_slots,
+                        &glz_window,
+                        &mut cancel,
+                    )
+                    .await?;
+                    let surface = canvas::render_text(
+                        &surfaces,
+                        &command,
+                        foreground_pattern.as_ref(),
+                        background_pattern.as_ref(),
+                    )
+                    .await?;
+                    notify_surface(
+                        &frame_sender,
+                        connection_generation,
+                        graphics_epoch,
+                        command.base.surface_id,
+                        command.base.destination,
+                        surface,
+                    );
+                }
+                display_server::DRAW_TRANSPARENT => {
+                    let command = DrawTransparent::decode(message.body)?;
+                    let source = prepare_composite_image(
+                        message.body,
+                        command.source_image,
+                        &mut palette_cache,
+                        &image_decode_slots,
+                        &glz_window,
+                        &mut cancel,
+                    )
+                    .await?;
+                    let surface = canvas::render_transparent(&surfaces, &command, &source).await?;
+                    notify_surface(
+                        &frame_sender,
+                        connection_generation,
+                        graphics_epoch,
+                        command.base.surface_id,
+                        command.base.destination,
+                        surface,
+                    );
+                }
+                display_server::DRAW_ALPHA_BLEND => {
+                    let command = DrawAlphaBlend::decode(message.body)?;
+                    let source = prepare_composite_image(
+                        message.body,
+                        command.source_image,
+                        &mut palette_cache,
+                        &image_decode_slots,
+                        &glz_window,
+                        &mut cancel,
+                    )
+                    .await?;
+                    let surface = canvas::render_alpha_blend(&surfaces, &command, &source).await?;
+                    notify_surface(
+                        &frame_sender,
+                        connection_generation,
+                        graphics_epoch,
+                        command.base.surface_id,
+                        command.base.destination,
+                        surface,
+                    );
+                }
+                display_server::COPY_BITS => {
+                    let copy = CopyBits::decode(message.body)?;
+                    let surface = surface_for_update(&surfaces, copy.surface_id)?;
+                    surface.inner.write().await.copy_bits(&copy)?;
+                    notify_surface(
+                        &frame_sender,
+                        connection_generation,
+                        graphics_epoch,
+                        copy.surface_id,
+                        copy.destination,
+                        surface,
+                    );
+                }
+                #[cfg(feature = "composite-pixman")]
+                display_server::DRAW_COMPOSITE => {
+                    let composite = DrawComposite::decode(message.body)?;
+                    let source = prepare_composite_image(
+                        message.body,
+                        composite.source,
+                        &mut palette_cache,
+                        &image_decode_slots,
+                        &glz_window,
+                        &mut cancel,
+                    )
+                    .await?;
+                    let mask = match composite.mask {
+                        Some(mask) => Some(
+                            prepare_composite_image(
+                                message.body,
+                                mask,
+                                &mut palette_cache,
+                                &image_decode_slots,
+                                &glz_window,
+                                &mut cancel,
+                            )
+                            .await?,
+                        ),
+                        None => None,
+                    };
+                    let destination =
+                        composite_prepared(&surfaces, &composite, source, mask).await?;
+                    notify_surface(
+                        &frame_sender,
+                        connection_generation,
+                        graphics_epoch,
+                        composite.destination_surface_id,
+                        composite.destination,
+                        destination,
+                    );
+                }
+                #[cfg(not(feature = "composite-pixman"))]
+                display_server::DRAW_COMPOSITE => {
+                    return Err(unsupported_wire("Draw Composite without composite-pixman"));
+                }
+                #[cfg(unix)]
+                display_server::GL_SCANOUT_UNIX => {
+                    let scanout = GlScanoutUnix::decode(message.body)?;
+                    gl_scanout = if scanout.disabled() {
+                        None
+                    } else {
+                        let file_descriptor = channel
+                            .take_received_file_descriptor()?
+                            .ok_or_else(|| protocol_value_error("missing GL scanout descriptor"))?;
+                        Some(Arc::new(DmaBufScanout {
+                            width: scanout.width,
+                            height: scanout.height,
+                            fourcc: scanout.fourcc,
+                            modifier: 0,
+                            top_down: scanout.top_down,
+                            planes: vec![DmaBufPlane {
+                                file_descriptor: Arc::new(file_descriptor),
+                                offset: 0,
+                                stride: scanout.stride,
+                            }]
+                            .into(),
+                        }))
+                    };
+                }
+                #[cfg(unix)]
+                display_server::GL_SCANOUT2_UNIX => {
+                    let scanout = GlScanout2Unix::decode(message.body)?;
+                    if scanout.disabled() {
+                        gl_scanout = None;
+                    } else {
+                        let mut planes = Vec::with_capacity(scanout.planes.len());
+                        for plane in scanout.planes {
+                            let file_descriptor =
+                                channel.take_received_file_descriptor()?.ok_or_else(|| {
+                                    protocol_value_error("missing GL scanout2 descriptor")
+                                })?;
+                            planes.push(DmaBufPlane {
+                                file_descriptor: Arc::new(file_descriptor),
+                                offset: plane.offset,
+                                stride: plane.stride,
+                            });
+                        }
+                        gl_scanout = Some(Arc::new(DmaBufScanout {
+                            width: scanout.width,
+                            height: scanout.height,
+                            fourcc: scanout.fourcc,
+                            modifier: scanout.modifier,
+                            top_down: scanout.top_down,
+                            planes: planes.into(),
+                        }));
+                    }
+                }
+                #[cfg(unix)]
+                display_server::GL_DRAW => {
+                    let dirty = GlDraw::decode(message.body)?;
+                    let scanout = gl_scanout
+                        .as_ref()
+                        .cloned()
+                        .ok_or_else(|| protocol_value_error("GL draw without scanout"))?;
+                    if dirty
+                        .x
+                        .checked_add(dirty.width)
+                        .is_none_or(|right| right > scanout.width)
+                        || dirty
+                            .y
+                            .checked_add(dirty.height)
+                            .is_none_or(|bottom| bottom > scanout.height)
+                    {
+                        return Err(protocol_value_error("GL draw outside scanout"));
+                    }
+                    let (completion, completed) = oneshot::channel();
+                    let frame = GlFrame {
+                        connection_generation,
+                        display_channel_id,
+                        dirty,
+                        scanout,
+                        completion: Some(completion),
+                    };
+                    tokio::select! {
+                        changed = cancel.changed() => {
+                            if changed.is_err() || *cancel.borrow() {
+                                let _ = channel.shutdown().await;
+                                return Ok(());
+                            }
+                        }
+                        sent = gl_frame_sender.send(frame) => {
+                            sent.map_err(|_| ClientError::TaskTerminated)?;
+                        }
+                    }
+                    tokio::select! {
+                        changed = cancel.changed() => {
+                            if changed.is_err() || *cancel.borrow() {
+                                let _ = channel.shutdown().await;
+                                return Ok(());
+                            }
+                        }
+                        result = completed => {
+                            result.map_err(|_| ClientError::TaskTerminated)?;
+                        }
+                    }
+                    channel
+                        .write_message(display_client::GL_DRAW_DONE, &[])
+                        .await?;
+                }
+                common_server::MIGRATE | common_server::MIGRATE_DATA => {
+                    return Err(ClientError::UnsupportedMessage {
+                        channel: "display",
+                        message_type: message.header.message_type,
+                    });
+                }
+                message_type => {
+                    return Err(ClientError::UnsupportedMessage {
+                        channel: "display",
+                        message_type,
+                    });
+                }
             }
-            common_server::MIGRATE | common_server::MIGRATE_DATA => {
-                return Err(ClientError::UnsupportedMessage {
-                    channel: "display",
-                    message_type: message.header.message_type,
-                });
-            }
-            message_type => {
-                return Err(ClientError::UnsupportedMessage {
-                    channel: "display",
-                    message_type,
-                });
-            }
+        }
+        if counts_for_ack {
+            control.acknowledge_envelope(&mut channel).await?;
         }
         progress.complete(identity, serial)?;
     }
@@ -3269,8 +3002,10 @@ fn unsupported_wire(context: &'static str) -> ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "composite-pixman")]
     use oxide_spice_protocol::{CompositeSurface, Point16};
 
+    #[cfg(feature = "composite-pixman")]
     fn composite_command(
         operation: u8,
         destination: Rect,
@@ -3307,6 +3042,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "composite-pixman")]
     fn composite_source_operation_copies_surface_pixels() {
         let budget = Arc::new(SurfaceBudget {
             used: AtomicUsize::new(0),
@@ -3359,6 +3095,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "composite-pixman")]
     fn composite_a8_mask_applies_unified_alpha() {
         let budget = Arc::new(SurfaceBudget {
             used: AtomicUsize::new(0),
@@ -3534,162 +3271,6 @@ mod tests {
         drop(host_handle);
         assert_eq!(budget.used.load(Ordering::Acquire), 0);
         SurfaceData::new(create, budget).expect("released bytes can be reused");
-    }
-
-    #[test]
-    fn xrgb_surface_forces_display_alpha_opaque() {
-        let budget = Arc::new(SurfaceBudget {
-            used: AtomicUsize::new(0),
-            maximum: 4,
-        });
-        let mut surface = SurfaceData::new(
-            SurfaceCreate {
-                surface_id: 0,
-                width: 1,
-                height: 1,
-                format: SurfaceFormat::Xrgb32,
-                flags: SURFACE_FLAG_PRIMARY,
-            },
-            budget,
-        )
-        .expect("surface fits");
-        surface
-            .blit_bitmap(
-                &BitmapUpdate {
-                    surface_id: 0,
-                    destination: Rect {
-                        top: 0,
-                        left: 0,
-                        bottom: 1,
-                        right: 1,
-                    },
-                    source: Rect {
-                        top: 0,
-                        left: 0,
-                        bottom: 1,
-                        right: 1,
-                    },
-                    image_width: 1,
-                    image_height: 1,
-                    format: BitmapFormat::Rgba32,
-                    rop_descriptor: RASTER_OPERATION_PUT,
-                    scale_mode: 0,
-                    stride: 4,
-                    top_down: true,
-                    palette: None,
-                    pixel_bytes: &[1, 2, 3, 0],
-                },
-                None,
-            )
-            .expect("bitmap update applies");
-        assert_eq!(surface.pixel_bytes(), [3, 2, 1, u8::MAX]);
-    }
-
-    #[test]
-    fn a8_surface_preserves_only_source_alpha() {
-        let budget = Arc::new(SurfaceBudget {
-            used: AtomicUsize::new(0),
-            maximum: 4,
-        });
-        let mut surface = SurfaceData::new(
-            SurfaceCreate {
-                surface_id: 0,
-                width: 1,
-                height: 1,
-                format: SurfaceFormat::A8,
-                flags: 0,
-            },
-            budget,
-        )
-        .expect("surface fits");
-        surface
-            .blit_bitmap(
-                &BitmapUpdate {
-                    surface_id: 0,
-                    destination: Rect {
-                        top: 0,
-                        left: 0,
-                        bottom: 1,
-                        right: 1,
-                    },
-                    source: Rect {
-                        top: 0,
-                        left: 0,
-                        bottom: 1,
-                        right: 1,
-                    },
-                    image_width: 1,
-                    image_height: 1,
-                    format: BitmapFormat::Rgba32,
-                    rop_descriptor: RASTER_OPERATION_PUT,
-                    scale_mode: 0,
-                    stride: 4,
-                    top_down: true,
-                    palette: None,
-                    pixel_bytes: &[3, 2, 1, 37],
-                },
-                None,
-            )
-            .expect("bitmap update applies");
-        assert_eq!(surface.pixel_bytes(), [u8::MAX, u8::MAX, u8::MAX, 37]);
-    }
-
-    #[test]
-    fn a8_surface_accepts_alpha_only_lz_output() {
-        let budget = Arc::new(SurfaceBudget {
-            used: AtomicUsize::new(0),
-            maximum: 8,
-        });
-        let mut surface = SurfaceData::new(
-            SurfaceCreate {
-                surface_id: 0,
-                width: 2,
-                height: 1,
-                format: SurfaceFormat::A8,
-                flags: 0,
-            },
-            budget,
-        )
-        .expect("surface fits");
-        let update = CompressedImageUpdate {
-            surface_id: 0,
-            destination: Rect {
-                top: 0,
-                left: 0,
-                bottom: 1,
-                right: 2,
-            },
-            source: Rect {
-                top: 0,
-                left: 0,
-                bottom: 1,
-                right: 2,
-            },
-            image_width: 2,
-            image_height: 1,
-            image_type: DrawCopyImageType::LzRgb,
-            rop_descriptor: RASTER_OPERATION_PUT,
-            scale_mode: 0,
-            palette: None,
-            compressed_bytes: &[],
-            uncompressed_bytes: None,
-        };
-        surface
-            .blit_lz(
-                &update,
-                &DecodedImage {
-                    width: 2,
-                    height: 1,
-                    top_down: true,
-                    image_type: LzImageType::XxxAlpha,
-                    pixels: DecodedPixels::Alpha8(vec![11, 29]),
-                },
-            )
-            .expect("alpha plane applies");
-        assert_eq!(
-            surface.pixel_bytes(),
-            [u8::MAX, u8::MAX, u8::MAX, 11, u8::MAX, u8::MAX, u8::MAX, 29]
-        );
     }
 
     #[test]

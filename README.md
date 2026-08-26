@@ -15,6 +15,9 @@ OxideSpice is licensed under [Apache-2.0](LICENSE).
 - TCP and Unix-domain transports, Ticket authentication, SASL, and caller-configured rustls TLS.
 - Main, Display, Cursor, Inputs, Agent, Playback, Record, Port, WebDAV, USBredir, and Smartcard
   channel ownership.
+- The classic Display Canvas command set: Fill, Opaque, Copy/Blend, Blackness, Whiteness, Invers,
+  ROP3, Stroke, raster Text, Transparent, and Alpha Blend, with bounded clip, mask, brush, scaling,
+  path, and glyph handling.
 - Raw and indexed bitmaps, Composite/A8 rendering, LZ, GLZ, zlib-GLZ, LZ4, JPEG, JPEG-alpha, QUIC,
   MJPEG, VP8, H.264, VP9, and H.265 display paths.
 - Multiple displays, clipboard selections and binary formats, outgoing Agent file transfer, audio
@@ -46,7 +49,7 @@ boundaries intentionally use native code:
 
 | Boundary | Dependency model |
 | --- | --- |
-| Composite/A8 | System `pixman` through `pixman-sys` and `pkg-config`. |
+| Draw Composite | System `pixman` through `pixman-sys` and `pkg-config`. |
 | TLS | `ring`, which builds bundled C and assembly when `tls-ring` is enabled. |
 | SASL GSSAPI | System Kerberos/GSSAPI through `libgssapi-sys`. |
 | Opus | Bundled BSD-licensed libopus through `opusic-sys` and CMake. |
@@ -66,6 +69,18 @@ No native SPICE client library is linked. See the
 - Development packages for pixman, libvpx, Kerberos/GSSAPI, usbredir/libusb, and PC/SC when building
   the crates that use those integrations.
 
+`oxide-spice-client` enables `composite-pixman`, `audio-opus`, `sasl-gssapi`, `video-h264`,
+`video-h265`, and `video-vpx` by default. Each boundary can be disabled independently. A
+no-default-features build retains the Rust wire stack, password-based SASL, classic Canvas, image
+codecs, raw audio, and MJPEG without linking pixman, GSSAPI, libopus, OpenH264, libvpx, or the H.265
+decoder.
+
+`oxide-spice-helper` forwards those client feature switches and separately gates `tls-ring`,
+`usbredir`, `smartcard`, and `webdav`. Its defaults enable the complete helper. Building it with
+`--no-default-features` retains the stable stdio protocol and core session path without the optional
+transport-security, media, raster, device, or filesystem backends; requests for an omitted host
+integration fail explicitly at runtime.
+
 The protocol crate can be built independently without those native packages:
 
 ```sh
@@ -76,6 +91,12 @@ Build the complete workspace with:
 
 ```sh
 cargo build --workspace --all-features
+```
+
+Build the dependency-minimal helper with:
+
+```sh
+cargo build -p oxide-spice-helper --no-default-features
 ```
 
 ## Library quick start
@@ -149,6 +170,21 @@ Run the protocol and state tests:
 ```sh
 cargo test --workspace --all-features
 ```
+
+Check the client without optional raster or media backends:
+
+```sh
+cargo check -p oxide-spice-client --no-default-features --all-targets
+```
+
+With `cargo-fuzz` and LLVM/libFuzzer installed, exercise the bounded wire parsers with:
+
+```sh
+cargo fuzz run protocol_boundaries
+```
+
+`libfuzzer-sys` is confined to the standalone `fuzz` workspace and is not a library or release
+dependency.
 
 For a reproducible QEMU setup, see the
 [controlled interoperability procedure](docs/qemu-interoperability.md).

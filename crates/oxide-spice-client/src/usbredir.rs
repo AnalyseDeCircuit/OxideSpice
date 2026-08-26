@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::ClientError;
 use crate::channel::{
-    Channel, ChannelIdentity, ControlDisposition, ControlState, IncomingMessage, ProgressRegistry,
+    Channel, ChannelIdentity, ControlDisposition, ControlState, IncomingEnvelope, ProgressRegistry,
     handle_channel_wait,
 };
 
@@ -187,7 +187,8 @@ where
             }
             incoming = channel.read_message(&mut message_body) => {
                 let header = incoming?;
-                let message = IncomingMessage { header, body: &message_body };
+                let envelope = IncomingEnvelope::decode(header, &message_body)?;
+                let counts_for_ack = envelope.counts_for_ack();
                 let serial = channel.received_serial();
                 if let Some(seamless) =
                     channel.observe_migration_activation(&mut observed_migration_activation)
@@ -204,42 +205,47 @@ where
                         transport_generation,
                     });
                 }
-                if control.handle(&mut channel, &message).await? == ControlDisposition::Consumed {
-                    progress.complete(identity, serial)?;
-                    continue;
-                }
-                if handle_channel_wait(&progress, identity, serial, &mut cancel, &message).await? {
-                    progress.complete(identity, serial)?;
-                    continue;
-                }
-                let bytes: Arc<[u8]> = match message.header.message_type {
-                    SPICEVMC_DATA => Arc::from(message.body),
-                    SPICEVMC_COMPRESSED_DATA => {
-                        let compressed = SpiceVmcCompressedData::decode(
-                            message.body,
-                            MAX_USBREDIR_PACKET_BYTES,
-                        )?;
-                        decode_lz4_block_exact(
-                            compressed.compressed_bytes,
-                            compressed.uncompressed_size,
-                            MAX_USBREDIR_PACKET_BYTES,
-                        )?
-                        .into()
+                for message in envelope.messages() {
+                    if control.handle_without_ack(&mut channel, &message).await?
+                        == ControlDisposition::Consumed
+                    {
+                        continue;
                     }
-                    message_type => return Err(ClientError::UnsupportedMessage {
-                        channel: "usbredir",
-                        message_type,
-                    }),
-                };
-                let inbound = UsbRedirInbound {
-                    transport_generation,
-                    bytes,
-                };
-                match paths.inbound.try_send(inbound) {
-                    Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        return Err(resource_limit_error("usbredir byte queue"));
+                    if handle_channel_wait(&progress, identity, serial, &mut cancel, &message).await? {
+                        continue;
                     }
+                    let bytes: Arc<[u8]> = match message.header.message_type {
+                        SPICEVMC_DATA => Arc::from(message.body),
+                        SPICEVMC_COMPRESSED_DATA => {
+                            let compressed = SpiceVmcCompressedData::decode(
+                                message.body,
+                                MAX_USBREDIR_PACKET_BYTES,
+                            )?;
+                            decode_lz4_block_exact(
+                                compressed.compressed_bytes,
+                                compressed.uncompressed_size,
+                                MAX_USBREDIR_PACKET_BYTES,
+                            )?
+                            .into()
+                        }
+                        message_type => return Err(ClientError::UnsupportedMessage {
+                            channel: "usbredir",
+                            message_type,
+                        }),
+                    };
+                    let inbound = UsbRedirInbound {
+                        transport_generation,
+                        bytes,
+                    };
+                    match paths.inbound.try_send(inbound) {
+                        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            return Err(resource_limit_error("usbredir byte queue"));
+                        }
+                    }
+                }
+                if counts_for_ack {
+                    control.acknowledge_envelope(&mut channel).await?;
                 }
                 progress.complete(identity, serial)?;
             }

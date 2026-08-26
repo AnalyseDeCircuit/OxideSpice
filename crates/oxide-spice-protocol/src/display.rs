@@ -7,6 +7,7 @@ pub const MAX_STREAM_CLIP_RECTS: usize = 256;
 pub const MAX_STREAM_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_COMPOSITE_CLIP_RECTS: usize = 256;
 pub const MAX_GL_SCANOUT_PLANES: usize = 4;
+pub const MAX_INVALIDATE_RESOURCES: usize = 4_096;
 
 /// Display server-to-client message identifiers.
 pub mod display_server {
@@ -26,6 +27,15 @@ pub mod display_server {
     pub const DRAW_FILL: u16 = 302;
     pub const DRAW_OPAQUE: u16 = 303;
     pub const DRAW_COPY: u16 = 304;
+    pub const DRAW_BLEND: u16 = 305;
+    pub const DRAW_BLACKNESS: u16 = 306;
+    pub const DRAW_WHITENESS: u16 = 307;
+    pub const DRAW_INVERS: u16 = 308;
+    pub const DRAW_ROP3: u16 = 309;
+    pub const DRAW_STROKE: u16 = 310;
+    pub const DRAW_TEXT: u16 = 311;
+    pub const DRAW_TRANSPARENT: u16 = 312;
+    pub const DRAW_ALPHA_BLEND: u16 = 313;
     pub const SURFACE_CREATE: u16 = 314;
     pub const SURFACE_DESTROY: u16 = 315;
     pub const STREAM_DATA_SIZED: u16 = 316;
@@ -143,6 +153,64 @@ pub struct MonitorHead {
 pub struct MonitorsConfig {
     pub maximum_allowed: u16,
     pub heads: Vec<MonitorHead>,
+}
+
+/// One pixmap identity carried by Display Invalidate List.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidateResource {
+    pub id: u64,
+}
+
+/// A bounded exact resource invalidation list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidateList {
+    pub resources: Vec<InvalidateResource>,
+}
+
+impl InvalidateList {
+    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
+        let mut reader = Reader::new(body);
+        let count = usize::from(reader.u16("Display invalidation resource count")?);
+        if count > MAX_INVALIDATE_RESOURCES {
+            return Err(DecodeError::new(
+                DecodeErrorKind::ResourceLimit,
+                0,
+                "Display invalidation resource count",
+            ));
+        }
+        let expected = count.checked_mul(9).ok_or_else(|| {
+            DecodeError::new(
+                DecodeErrorKind::Overflow,
+                reader.offset(),
+                "Display invalidation resources",
+            )
+        })?;
+        if reader.remaining() != expected {
+            return Err(DecodeError::new(
+                if reader.remaining() < expected {
+                    DecodeErrorKind::Truncated
+                } else {
+                    DecodeErrorKind::InvalidValue
+                },
+                reader.offset(),
+                "Display invalidation resources",
+            ));
+        }
+        let mut resources = Vec::with_capacity(count);
+        for _ in 0..count {
+            if reader.u8("Display invalidation resource type")? != 1 {
+                return Err(DecodeError::new(
+                    DecodeErrorKind::Unsupported,
+                    reader.offset() - 1,
+                    "Display invalidation resource type",
+                ));
+            }
+            resources.push(InvalidateResource {
+                id: reader.u64("Display invalidation resource id")?,
+            });
+        }
+        Ok(Self { resources })
+    }
 }
 
 impl MonitorsConfig {
@@ -282,6 +350,11 @@ impl CompositeImage {
             Self::Embedded(image) => image.height,
         }
     }
+
+    /// Resolves one generic Display image pointer against its containing message body.
+    pub fn decode_at(body: &[u8], image_offset: u32) -> Result<Self, DecodeError> {
+        decode_composite_image(body, image_offset, "Display image")
+    }
 }
 
 /// A validated Draw Composite command using server-owned Display surfaces.
@@ -310,8 +383,6 @@ pub struct DrawComposite {
 impl DrawComposite {
     /// Decodes Composite flags and resolves every relative pointer before rendering.
     pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
-        const CLIP_NONE: u8 = 0;
-        const CLIP_RECTS: u8 = 1;
         const HAS_MASK: u32 = 1 << 19;
         const HAS_SOURCE_TRANSFORM: u32 = 1 << 20;
         const HAS_MASK_TRANSFORM: u32 = 1 << 21;
@@ -323,66 +394,7 @@ impl DrawComposite {
         let mut reader = Reader::new(body);
         let destination_surface_id = reader.u32("Composite destination surface")?;
         let destination = read_rect(&mut reader, "Composite destination")?;
-        let clip = match reader.u8("Composite clip type")? {
-            CLIP_NONE => CompositeClip::None,
-            CLIP_RECTS => {
-                let rectangles_offset = reader.u32("Composite clip rectangles offset")?;
-                let count_range =
-                    resolve_range(body, rectangles_offset, 4, "Composite clip count")?;
-                let mut count_reader = Reader::new(&body[count_range]);
-                let count = usize::try_from(count_reader.u32("Composite clip rectangle count")?)
-                    .map_err(|_| {
-                        DecodeError::new(
-                            DecodeErrorKind::Overflow,
-                            usize::try_from(rectangles_offset).unwrap_or(usize::MAX),
-                            "Composite clip rectangle count",
-                        )
-                    })?;
-                if count > MAX_COMPOSITE_CLIP_RECTS {
-                    return Err(DecodeError::new(
-                        DecodeErrorKind::ResourceLimit,
-                        usize::try_from(rectangles_offset).unwrap_or(usize::MAX),
-                        "Composite clip rectangle count",
-                    ));
-                }
-                let rectangle_bytes = count.checked_mul(16).ok_or_else(|| {
-                    DecodeError::new(
-                        DecodeErrorKind::Overflow,
-                        usize::try_from(rectangles_offset).unwrap_or(usize::MAX),
-                        "Composite clip rectangles",
-                    )
-                })?;
-                let rectangles_start = rectangles_offset.checked_add(4).ok_or_else(|| {
-                    DecodeError::new(
-                        DecodeErrorKind::Overflow,
-                        usize::try_from(rectangles_offset).unwrap_or(usize::MAX),
-                        "Composite clip rectangles",
-                    )
-                })?;
-                let rectangles_range = resolve_range(
-                    body,
-                    rectangles_start,
-                    rectangle_bytes,
-                    "Composite clip rectangles",
-                )?;
-                let mut rectangle_reader = Reader::new(&body[rectangles_range]);
-                let mut rectangles = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let rectangle = read_rect(&mut rectangle_reader, "Composite clip rectangle")?;
-                    let _ = rectangle.width()?;
-                    let _ = rectangle.height()?;
-                    rectangles.push(rectangle);
-                }
-                CompositeClip::Rectangles(rectangles)
-            }
-            _ => {
-                return Err(DecodeError::new(
-                    DecodeErrorKind::Unsupported,
-                    reader.offset() - 1,
-                    "Composite clip type",
-                ));
-            }
-        };
+        let clip = decode_display_clip(&mut reader, "Composite clip")?;
         let flags = reader.u32("Composite flags")?;
         if flags & !KNOWN_FLAGS != 0 {
             return Err(DecodeError::new(
@@ -447,6 +459,44 @@ impl DrawComposite {
             source_origin,
             mask_origin,
         })
+    }
+}
+
+pub(crate) fn decode_display_clip(
+    reader: &mut Reader<'_>,
+    context: &'static str,
+) -> Result<CompositeClip, DecodeError> {
+    match reader.u8(context)? {
+        0 => Ok(CompositeClip::None),
+        1 => {
+            let count_offset = reader.offset();
+            let count = usize::try_from(reader.u32(context)?)
+                .map_err(|_| DecodeError::new(DecodeErrorKind::Overflow, count_offset, context))?;
+            if count > MAX_COMPOSITE_CLIP_RECTS {
+                return Err(DecodeError::new(
+                    DecodeErrorKind::ResourceLimit,
+                    count_offset,
+                    context,
+                ));
+            }
+            let rectangle_bytes = count.checked_mul(16).ok_or_else(|| {
+                DecodeError::new(DecodeErrorKind::Overflow, reader.offset(), context)
+            })?;
+            let mut rectangles_reader = Reader::new(reader.take(rectangle_bytes, context)?);
+            let mut rectangles = Vec::with_capacity(count);
+            for _ in 0..count {
+                let rectangle = read_rect(&mut rectangles_reader, context)?;
+                let _ = rectangle.width()?;
+                let _ = rectangle.height()?;
+                rectangles.push(rectangle);
+            }
+            Ok(CompositeClip::Rectangles(rectangles))
+        }
+        _ => Err(DecodeError::new(
+            DecodeErrorKind::Unsupported,
+            reader.offset() - 1,
+            context,
+        )),
     }
 }
 
@@ -1129,87 +1179,23 @@ impl SurfaceCreate {
     }
 }
 
-/// A validated solid-color Draw Fill operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SolidFill {
-    pub surface_id: u32,
-    pub destination: Rect,
-    pub color_bgrx: u32,
-    pub rop_descriptor: u16,
-}
-
-impl SolidFill {
-    /// Decodes the no-clip, solid-brush, no-mask subset needed by baseline QEMU output.
-    pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
-        let mut reader = Reader::new(body);
-        let surface_id = reader.u32("fill surface id")?;
-        let destination = read_rect(&mut reader, "fill destination")?;
-        if reader.u8("fill clip type")? != 0 {
-            return Err(DecodeError::new(
-                DecodeErrorKind::Unsupported,
-                reader.offset() - 1,
-                "fill clip rectangles",
-            ));
-        }
-        if reader.u8("fill brush type")? != 1 {
-            return Err(DecodeError::new(
-                DecodeErrorKind::Unsupported,
-                reader.offset() - 1,
-                "fill brush type",
-            ));
-        }
-        let color_bgrx = reader.u32("fill color")?;
-        let rop_descriptor = reader.u16("fill raster operation")?;
-        let _mask_flags = reader.u8("fill mask flags")?;
-        let _mask_x = reader.i32("fill mask x")?;
-        let _mask_y = reader.i32("fill mask y")?;
-        if reader.u32("fill mask bitmap")? != 0 {
-            return Err(DecodeError::new(
-                DecodeErrorKind::Unsupported,
-                reader.offset() - 4,
-                "fill mask image",
-            ));
-        }
-        if reader.remaining() != 0 {
-            return Err(DecodeError::new(
-                DecodeErrorKind::InvalidValue,
-                reader.offset(),
-                "fill trailing bytes",
-            ));
-        }
-        let _ = destination.width()?;
-        let _ = destination.height()?;
-        Ok(Self {
-            surface_id,
-            destination,
-            color_bgrx,
-            rop_descriptor,
-        })
-    }
-}
-
 /// A validated same-surface Copy Bits operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyBits {
     pub surface_id: u32,
     pub destination: Rect,
+    pub clip: CompositeClip,
     pub source_x: i32,
     pub source_y: i32,
 }
 
 impl CopyBits {
-    /// Decodes the no-clip baseline form.
+    /// Decodes a same-surface copy with an optional inline rectangle clip.
     pub fn decode(body: &[u8]) -> Result<Self, DecodeError> {
         let mut reader = Reader::new(body);
         let surface_id = reader.u32("copy bits surface id")?;
         let destination = read_rect(&mut reader, "copy bits destination")?;
-        if reader.u8("copy bits clip type")? != 0 {
-            return Err(DecodeError::new(
-                DecodeErrorKind::Unsupported,
-                reader.offset() - 1,
-                "copy bits clip rectangles",
-            ));
-        }
+        let clip = decode_display_clip(&mut reader, "copy bits clip")?;
         let source_x = reader.i32("copy bits source x")?;
         let source_y = reader.i32("copy bits source y")?;
         if reader.remaining() != 0 {
@@ -1224,6 +1210,7 @@ impl CopyBits {
         Ok(Self {
             surface_id,
             destination,
+            clip,
             source_x,
             source_y,
         })
@@ -1251,7 +1238,7 @@ impl DisplayInit {
     }
 }
 
-/// Raw bitmap formats supported by the first vertical path.
+/// SPICE bitmap wire formats accepted by the bounded image decoders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum BitmapFormat {
@@ -1475,7 +1462,7 @@ impl<'a> BitmapUpdate<'a> {
     /// Default raw-image byte bound for one decoded image.
     pub const DEFAULT_MAX_BITMAP_BYTES: usize = 256 * 1024 * 1024;
 
-    /// Decodes the no-clip Draw Copy subset and resolves its relative image address.
+    /// Decodes a specialized raw-bitmap Draw Copy payload and resolves its relative image address.
     pub fn decode_draw_copy(
         body: &'a [u8],
         maximum_bitmap_bytes: usize,
@@ -2539,7 +2526,10 @@ fn decode_embedded_jpeg<'a>(
 }
 
 /// Reads one rectangle while preserving the protocol's signed coordinates.
-fn read_rect(reader: &mut Reader<'_>, context: &'static str) -> Result<Rect, DecodeError> {
+pub(crate) fn read_rect(
+    reader: &mut Reader<'_>,
+    context: &'static str,
+) -> Result<Rect, DecodeError> {
     Ok(Rect {
         top: reader.i32(context)?,
         left: reader.i32(context)?,

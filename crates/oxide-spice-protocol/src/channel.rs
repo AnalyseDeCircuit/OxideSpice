@@ -1,8 +1,10 @@
-use crate::wire::Reader;
+use crate::wire::{Reader, resolve_range};
 use crate::{DecodeError, DecodeErrorKind};
 
 /// Maximum channel barriers carried by one Wait For Channels message.
 pub const MAX_CHANNEL_WAITS: usize = 64;
+/// Maximum logical messages accepted from one sub-message envelope.
+pub const MAX_SUBMESSAGES: usize = 64;
 
 /// SPICE channel type values from `spice-protocol`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -75,6 +77,197 @@ pub struct DataHeader {
     pub sub_list_offset: Option<u32>,
 }
 
+/// One borrowed logical message resolved from a SPICE sub-message list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubMessage<'a> {
+    pub message_type: u16,
+    pub body: &'a [u8],
+}
+
+/// A fully validated, allocation-free view over one SPICE sub-message list.
+#[derive(Debug, Clone, Copy)]
+pub struct SubMessageList<'a> {
+    body: &'a [u8],
+    offsets_start: usize,
+    count: usize,
+}
+
+impl<'a> SubMessageList<'a> {
+    /// Validates every offset and declared body before any logical message is dispatched.
+    pub fn decode(body: &'a [u8], list_offset: u32) -> Result<Self, DecodeError> {
+        let list_start = resolve_range(body, list_offset, 2, "sub-message list")?.start;
+        let mut list_reader = Reader::new(&body[list_start..]);
+        let count = usize::from(list_reader.u16("sub-message count")?);
+        if count > MAX_SUBMESSAGES {
+            return Err(DecodeError::new(
+                DecodeErrorKind::ResourceLimit,
+                list_start,
+                "sub-message count",
+            ));
+        }
+        let offsets_start = list_start.checked_add(2).ok_or_else(|| {
+            DecodeError::new(DecodeErrorKind::Overflow, list_start, "sub-message offsets")
+        })?;
+        let offsets_bytes = count.checked_mul(4).ok_or_else(|| {
+            DecodeError::new(
+                DecodeErrorKind::Overflow,
+                offsets_start,
+                "sub-message offsets",
+            )
+        })?;
+        let offsets_range = resolve_range(
+            body,
+            u32::try_from(offsets_start).map_err(|_| {
+                DecodeError::new(
+                    DecodeErrorKind::Overflow,
+                    offsets_start,
+                    "sub-message offsets",
+                )
+            })?,
+            offsets_bytes,
+            "sub-message offsets",
+        )?;
+        let table_end = offsets_range.end;
+        for index in 0..count {
+            let offset = read_submessage_offset(body, offsets_start, index)?;
+            for earlier in 0..index {
+                if read_submessage_offset(body, offsets_start, earlier)? == offset {
+                    return Err(DecodeError::new(
+                        DecodeErrorKind::InvalidOffset,
+                        offsets_start + index * 4,
+                        "duplicate sub-message offset",
+                    ));
+                }
+            }
+            let header = resolve_range(body, offset, 6, "sub-message header")?;
+            let mut message_reader = Reader::new(&body[header.clone()]);
+            let message_type = message_reader.u16("sub-message type")?;
+            if message_type == common_server::LIST {
+                return Err(DecodeError::new(
+                    DecodeErrorKind::Unsupported,
+                    header.start,
+                    "nested sub-message list",
+                ));
+            }
+            let message_size =
+                usize::try_from(message_reader.u32("sub-message size")?).map_err(|_| {
+                    DecodeError::new(
+                        DecodeErrorKind::Overflow,
+                        header.start + 2,
+                        "sub-message size",
+                    )
+                })?;
+            let message_end = header.end.checked_add(message_size).ok_or_else(|| {
+                DecodeError::new(DecodeErrorKind::Overflow, header.end, "sub-message body")
+            })?;
+            if message_end > body.len() {
+                return Err(DecodeError::new(
+                    DecodeErrorKind::InvalidOffset,
+                    header.end,
+                    "sub-message body",
+                ));
+            }
+            if ranges_overlap(header.start, message_end, list_start, table_end) {
+                return Err(DecodeError::new(
+                    DecodeErrorKind::InvalidOffset,
+                    header.start,
+                    "sub-message overlaps list",
+                ));
+            }
+        }
+        Ok(Self {
+            body,
+            offsets_start,
+            count,
+        })
+    }
+
+    pub const fn len(&self) -> usize {
+        self.count
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    pub fn iter(&self) -> SubMessages<'a> {
+        SubMessages {
+            list: *self,
+            index: 0,
+        }
+    }
+}
+
+/// Iterator over a list that was completely validated before construction.
+pub struct SubMessages<'a> {
+    list: SubMessageList<'a>,
+    index: usize,
+}
+
+impl<'a> Iterator for SubMessages<'a> {
+    type Item = SubMessage<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index == self.list.count {
+            return None;
+        }
+        let offset = read_submessage_offset(self.list.body, self.list.offsets_start, self.index)
+            .expect("validated sub-message offset");
+        self.index += 1;
+        let start = usize::try_from(offset).expect("validated offset fits usize");
+        let mut reader = Reader::new(&self.list.body[start..]);
+        let message_type = reader.u16("sub-message type").expect("validated type");
+        let size = usize::try_from(reader.u32("sub-message size").expect("validated size"))
+            .expect("validated size fits usize");
+        Some(SubMessage {
+            message_type,
+            body: reader
+                .take(size, "sub-message body")
+                .expect("validated body"),
+        })
+    }
+}
+
+fn read_submessage_offset(
+    body: &[u8],
+    offsets_start: usize,
+    index: usize,
+) -> Result<u32, DecodeError> {
+    let start = offsets_start
+        .checked_add(index.checked_mul(4).ok_or_else(|| {
+            DecodeError::new(
+                DecodeErrorKind::Overflow,
+                offsets_start,
+                "sub-message offset",
+            )
+        })?)
+        .ok_or_else(|| {
+            DecodeError::new(
+                DecodeErrorKind::Overflow,
+                offsets_start,
+                "sub-message offset",
+            )
+        })?;
+    let range = resolve_range(
+        body,
+        u32::try_from(start).map_err(|_| {
+            DecodeError::new(DecodeErrorKind::Overflow, start, "sub-message offset")
+        })?,
+        4,
+        "sub-message offset",
+    )?;
+    Reader::new(&body[range]).u32("sub-message offset")
+}
+
+const fn ranges_overlap(
+    first_start: usize,
+    first_end: usize,
+    second_start: usize,
+    second_end: usize,
+) -> bool {
+    first_start < second_end && second_start < first_end
+}
+
 impl DataHeader {
     /// Decodes exactly the already-negotiated header representation.
     pub fn decode(framing: Framing, input: &[u8]) -> Result<Self, DecodeError> {
@@ -131,6 +324,7 @@ pub mod common_server {
     pub const WAIT_FOR_CHANNELS: u16 = 5;
     pub const DISCONNECTING: u16 = 6;
     pub const NOTIFY: u16 = 7;
+    pub const LIST: u16 = 8;
 }
 
 /// Common client-to-server message identifiers inherited by every channel.
@@ -210,5 +404,46 @@ mod tests {
         body.push(0);
         let error = WaitForChannels::decode(&body).expect_err("trailing bytes must fail");
         assert_eq!(error.kind, DecodeErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn submessages_follow_list_order_instead_of_physical_order() {
+        let mut body = 2_u16.to_le_bytes().to_vec();
+        body.extend_from_slice(&20_u32.to_le_bytes());
+        body.extend_from_slice(&12_u32.to_le_bytes());
+        body.extend_from_slice(&[0, 0]);
+        body.extend_from_slice(&101_u16.to_le_bytes());
+        body.extend_from_slice(&1_u32.to_le_bytes());
+        body.push(0xaa);
+        body.push(0);
+        body.extend_from_slice(&202_u16.to_le_bytes());
+        body.extend_from_slice(&1_u32.to_le_bytes());
+        body.push(0xbb);
+
+        let list = SubMessageList::decode(&body, 0).expect("valid sub-message list");
+        let messages: Vec<_> = list.iter().collect();
+        assert_eq!(messages[0].message_type, 202);
+        assert_eq!(messages[0].body, [0xbb]);
+        assert_eq!(messages[1].message_type, 101);
+        assert_eq!(messages[1].body, [0xaa]);
+    }
+
+    #[test]
+    fn submessage_list_is_fully_validated_before_iteration() {
+        let mut duplicate = 2_u16.to_le_bytes().to_vec();
+        duplicate.extend_from_slice(&10_u32.to_le_bytes());
+        duplicate.extend_from_slice(&10_u32.to_le_bytes());
+        duplicate.extend_from_slice(&101_u16.to_le_bytes());
+        duplicate.extend_from_slice(&0_u32.to_le_bytes());
+        let error = SubMessageList::decode(&duplicate, 0)
+            .expect_err("duplicate side effects must be rejected");
+        assert_eq!(error.kind, DecodeErrorKind::InvalidOffset);
+
+        let mut overlap = 1_u16.to_le_bytes().to_vec();
+        overlap.extend_from_slice(&2_u32.to_le_bytes());
+        overlap.extend_from_slice(&0_u32.to_le_bytes());
+        let error = SubMessageList::decode(&overlap, 0)
+            .expect_err("a sub-message cannot overlap its offset table");
+        assert_eq!(error.kind, DecodeErrorKind::InvalidOffset);
     }
 }

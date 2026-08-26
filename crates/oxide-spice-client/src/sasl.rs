@@ -1,7 +1,9 @@
 //! SPICE SASL negotiation and optional post-authentication security framing.
 
 use rsasl::callback::{Context, Request, SessionCallback, SessionData};
+#[cfg(feature = "sasl-gssapi")]
 use rsasl::mechanisms::gssapi::GSSAPI;
+#[cfg(feature = "sasl-gssapi")]
 use rsasl::mechanisms::gssapi::properties::{GssSecurityLayer, GssService, SecurityLayer};
 use rsasl::mechanisms::login::LOGIN;
 use rsasl::mechanisms::plain::PLAIN;
@@ -91,6 +93,11 @@ impl SaslOptions {
                 "SASL requires credentials or GSSAPI",
             ));
         }
+        if self.allow_gssapi && self.credentials.is_none() && !cfg!(feature = "sasl-gssapi") {
+            return Err(ClientError::Configuration(
+                "GSSAPI is disabled in this client build",
+            ));
+        }
         if self
             .credentials
             .as_ref()
@@ -124,10 +131,12 @@ pub(crate) struct SaslParameters<'a> {
 
 struct SaslCallback {
     hostname: String,
+    #[cfg(feature = "sasl-gssapi")]
     service: String,
     authentication_id: Option<String>,
     authorization_id: Option<String>,
     password: Option<Zeroizing<String>>,
+    #[cfg(feature = "sasl-gssapi")]
     security_layers: SecurityLayer,
 }
 
@@ -147,8 +156,9 @@ impl SessionCallback for SaslCallback {
         if let Some(password) = self.password.as_deref() {
             request.satisfy::<Password>(password.as_bytes())?;
         }
+        request.satisfy::<Hostname>(&self.hostname)?;
+        #[cfg(feature = "sasl-gssapi")]
         request
-            .satisfy::<Hostname>(&self.hostname)?
             .satisfy::<GssService>(&self.service)?
             .satisfy::<GssSecurityLayer>(&self.security_layers)?;
         Ok(())
@@ -207,13 +217,17 @@ where
     let callback = sasl_callback(parameters);
     static PASSWORD_MECHANISMS: &[Mechanism] =
         &[SCRAM_SHA512, SCRAM_SHA256, SCRAM_SHA1, PLAIN, LOGIN];
+    #[cfg(feature = "sasl-gssapi")]
     static GSSAPI_MECHANISMS: &[Mechanism] =
         &[GSSAPI, SCRAM_SHA512, SCRAM_SHA256, SCRAM_SHA1, PLAIN, LOGIN];
+    #[cfg(feature = "sasl-gssapi")]
     let registry = if parameters.options.allow_gssapi {
         Registry::with_mechanisms(GSSAPI_MECHANISMS)
     } else {
         Registry::with_mechanisms(PASSWORD_MECHANISMS)
     };
+    #[cfg(not(feature = "sasl-gssapi"))]
+    let registry = Registry::with_mechanisms(PASSWORD_MECHANISMS);
     let config = SASLConfig::builder()
         .with_registry(registry)
         .with_callback(callback)
@@ -308,10 +322,12 @@ fn sasl_callback(parameters: SaslParameters<'_>) -> SaslCallback {
     let credentials = parameters.options.credentials.as_ref();
     SaslCallback {
         hostname: parameters.options.hostname.clone(),
+        #[cfg(feature = "sasl-gssapi")]
         service: parameters.options.service.clone(),
         authentication_id: credentials.map(|value| value.authentication_id.clone()),
         authorization_id: credentials.and_then(|value| value.authorization_id.clone()),
         password: credentials.map(|value| value.password.clone()),
+        #[cfg(feature = "sasl-gssapi")]
         security_layers: if parameters.require_security_layer {
             SecurityLayer::INTEGRITY | SecurityLayer::CONFIDENTIALITY
         } else {

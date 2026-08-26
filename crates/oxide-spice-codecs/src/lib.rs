@@ -4,7 +4,10 @@ mod glz;
 mod jpeg;
 mod lz;
 mod lz4;
+#[cfg(feature = "audio-opus")]
 mod opus;
+#[cfg(not(feature = "audio-opus"))]
+mod opus_disabled;
 mod quic;
 mod video;
 mod zlib;
@@ -20,7 +23,13 @@ pub use lz4::{
     DecodedLz4Image, Lz4Error, Lz4ErrorKind, compress_lz4_block_if_smaller, decode_lz4_block_exact,
     decode_lz4_with_cancel,
 };
+#[cfg(feature = "audio-opus")]
 pub use opus::{
+    OPUS_COMPRESSED_FRAME_BYTES, OPUS_FRAME_SAMPLES_PER_CHANNEL, OpusCodecError, SpiceOpusDecoder,
+    SpiceOpusEncoder, supports_spice_opus_format,
+};
+#[cfg(not(feature = "audio-opus"))]
+pub use opus_disabled::{
     OPUS_COMPRESSED_FRAME_BYTES, OPUS_FRAME_SAMPLES_PER_CHANNEL, OpusCodecError, SpiceOpusDecoder,
     SpiceOpusEncoder, supports_spice_opus_format,
 };

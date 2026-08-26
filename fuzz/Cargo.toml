@@ -1,0 +1,22 @@
+[package]
+name = "oxide-spice-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.10"
+oxide-spice-protocol = { path = "../crates/oxide-spice-protocol" }
+
+[[bin]]
+name = "protocol_boundaries"
+path = "fuzz_targets/protocol_boundaries.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

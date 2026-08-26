@@ -24,14 +24,14 @@ openh264 = "0.9.8"
 opus = "0.4.0"
 pcsc = "2.9.0"
 pixman = "0.2.1"
-oxide-spice-codecs = { path = "crates/oxide-spice-codecs" }
+oxide-spice-codecs = { path = "crates/oxide-spice-codecs", default-features = false }
 oxide-spice-protocol = { path = "crates/oxide-spice-protocol" }
 rsa = { version = "0.9.10", default-features = false, features = ["std", "u64_digit"] }
 sha1 = "0.10.6"
 thiserror = "2.0.20"
 rust_h265 = "0.1.0"
 rustix = { version = "1.1.4", default-features = false, features = ["std", "fs", "net"] }
-rsasl = { version = "2.3.1", default-features = false, features = ["config_builder", "gssapi", "login", "plain", "provider", "scram-sha-1", "scram-sha-2"] }
+rsasl = { version = "2.3.1", default-features = false, features = ["config_builder", "login", "plain", "provider", "scram-sha-1", "scram-sha-2"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.47.1", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }

@@ -59,8 +59,9 @@ Link 错误对相应通道是终止错误。`NEED_SECURED` 和 `NEED_UNSECURED` 
   每个所有者只在完成消息状态转换后发布进度；等待方休眠到目标单调 serial，并保持
   可取消。Mini header 使用本地推导的接收 serial；完整头 serial 可以跳号但不能回退。
 - 断开过程停止接收新工作、记录远端原因、执行有界协作清理并关闭通道。
-- 完整头中的 sub-message 和协议地址偏移均相对于当前消息 body，不会被当作宿主指针，
-  也不能引用其他帧。
+- 完整头 sub-message list 与迷你头 `SPICE_MSG_LIST` envelope 会在分发前完成整体校验。
+  sub-message 按列表顺序先于主消息执行；ACK 计数和跨通道进度只按所属 wire envelope
+  前进一次。所有偏移仍相对于当前有界 body，不会被当作宿主指针。
 
 ## 能力矩阵
 
@@ -85,6 +86,12 @@ Link 错误对相应通道是终止错误。`NEED_SECURED` 和 `NEED_UNSECURED` 
 | 文件传输 | Agent Start/Status/Data 和 token 流控；剪贴板文件列表改用 WebDAV | 出站传输只接受 basename，最多八个活动身份，每块 64 KiB。每个所有者同时只有一个已完整分片的 chunk 在途，支持终止状态和显式取消。文件系统 I/O 位于客户端 crate 之外。 |
 
 ### 图像与视频流格式
+
+经典 Canvas 路径实现 302 至 313 消息。共享 renderer 处理内联矩形 clip、定位 QMask
+位图、纯色与重复 pattern brush、nearest 或 interpolate 缩放、二元 ROP descriptor 以及
+任意 ROP3 真值表。Stroke 对有界 fixed28.4 path 实现 cosmetic line、dash、close 和
+Bezier；Text 对有界 A1/A4/A8 光栅 glyph 进行绘制。客户端发布零字节 pixmap cache，
+因此 cache-reference image type 不属于协商后的消息流；palette 与 GLZ cache 仍分别有界。
 
 | 格式 | 协商语义 | 策略 |
 | --- | --- | --- |
@@ -259,11 +266,16 @@ workspace 包含四个 crate：
 和 WebDAV 本地文件系统后端使用 `libc` 等 Rust OS binding，但不会链接 C SPICE 客户端。
 
 Composite 渲染使用 MIT 许可证的 `pixman`/`pixman-sys` binding，通过 `pkg-config` 动态
-链接系统 pixman。该原生光栅边界实现完整 SPICE/Pixman operation、transform、filter、
+链接系统 pixman。该原生光栅边界实现 Draw Composite 的 operation、transform、filter、
 repeat、component-alpha、clip 和 A8 语义，不链接 SPICE 客户端库。Unix 描述符接收使用
 safe `rustix` API，所有项目 crate 均保持 `unsafe_code = "forbid"`。
 
-SASL 密码机制由 Rust `rsasl` 提供。启用编译内置的 GSSAPI 机制还会引入
+客户端通过 `composite-pixman`、`audio-opus`、`sasl-gssapi`、`video-h264`、
+`video-h265` 和 `video-vpx` 功能选择原生光栅、认证与媒体边界。完整客户端默认启用
+它们，也可逐项关闭。能力发布从实际编译功能推导；被关闭的 codec 或 Composite
+backend 不会向服务端发布。
+
+SASL 密码机制由 Rust `rsasl` 提供。启用 `sasl-gssapi` 还会引入
 `libgssapi`/`libgssapi-sys`、bindgen 和系统 Kerberos/GSSAPI 库。原生依赖只位于认证
 边界；SPICE SASL 帧和可选 security-layer record frame 仍由 Rust 客户端持有。
 
@@ -275,10 +287,14 @@ TLS 是显式的 `oxide-spice-client/tls-ring` 功能。它关闭 `tokio-rustls`
 server name 和 rustls 配置时，才接受源端提供的 certificate subject；缺少该策略时会在
 连接前终止迁移。
 
+helper 会转发上述开关，并分别用 `tls-ring`、`usbredir`、`smartcard` 和 `webdav` 控制
+宿主集成。IPC 结构不随功能组合变化；请求构建时省略的后端会返回明确的操作错误。
+
 原生依赖保持隔离并显式披露。`opus 0.4.0` 使用 `opusic-sys`，通过 CMake 编译采用 BSD
 许可证、随包提供且可能包含平台汇编的 libopus。helper 使用 `usbredirhost 0.4.1`，间接
-动态链接 `usbredirparser-sys` 和系统 usbredir/libusb；`pcsc 2.9.0` 通过 `pcsc-sys` 使用
-平台 PC/SC 服务。usbredir/libusb 是动态链接的 LGPL 库，并保留自身分发条款。
+动态链接 `usbredirparser-sys` 和系统 usbredir/libusb，此路径由 `usbredir` 功能控制；
+`pcsc 2.9.0` 通过 `pcsc-sys` 使用平台 PC/SC 服务，此路径由 `smartcard` 功能控制。
+usbredir/libusb 是动态链接的 LGPL 库，并保留自身分发条款。
 `oxide-spice-protocol` 不包含这些依赖。Display 和 SpiceVMC LZ4 使用 safe Rust
 `lz4_flex`，不使用 `lz4-sys`。
 
