@@ -26,7 +26,7 @@ jobs:
           sudo apt-get update &&
           sudo apt-get install --yes
           clang cmake libkrb5-dev libpcsclite-dev libpixman-1-dev libusb-1.0-0-dev
-          libusbredirparser-dev libvpx-dev nasm pkg-config
+          libusbredirhost-dev libvpx-dev nasm pkg-config
 
       - name: Install macOS native dependencies
         if: runner.os == 'macOS'
