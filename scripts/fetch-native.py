@@ -7,9 +7,10 @@ import argparse
 import hashlib
 import shutil
 import sys
-import tomllib
 import urllib.request
 from pathlib import Path
+
+from toml_compat import tomllib
 
 READ_CHUNK_SIZE = 1024 * 1024
 

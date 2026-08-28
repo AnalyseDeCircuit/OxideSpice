@@ -7,9 +7,10 @@ import argparse
 import json
 import shutil
 import subprocess
-import tomllib
 from collections import deque
 from pathlib import Path
+
+from toml_compat import tomllib
 
 
 def command_output(command: list[str]) -> str:

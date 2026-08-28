@@ -8,8 +8,9 @@ import os
 import shutil
 import subprocess
 import tarfile
-import tomllib
 from pathlib import Path
+
+from toml_compat import tomllib
 
 
 def run(command: list[str], *, cwd: Path | None = None, environment: dict[str, str] | None = None) -> None:

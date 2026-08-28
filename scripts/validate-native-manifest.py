@@ -7,8 +7,9 @@ import argparse
 import json
 import re
 import subprocess
-import tomllib
 from pathlib import Path
+
+from toml_compat import tomllib
 
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 EXPECTED_PLATFORMS = {"linux", "macos", "windows"}

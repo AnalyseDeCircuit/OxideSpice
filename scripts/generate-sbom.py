@@ -8,10 +8,11 @@ import datetime
 import json
 import os
 import subprocess
-import tomllib
 import urllib.parse
 import uuid
 from pathlib import Path
+
+from toml_compat import tomllib
 
 
 def timestamp() -> str:

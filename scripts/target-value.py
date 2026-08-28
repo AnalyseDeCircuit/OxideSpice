@@ -2,8 +2,9 @@
 """Print one release-target field for shell workflows."""
 
 import argparse
-import tomllib
 from pathlib import Path
+
+from toml_compat import tomllib
 
 
 def main() -> int:

@@ -8,9 +8,10 @@ import hashlib
 import json
 import re
 import tarfile
-import tomllib
 import zipfile
 from pathlib import Path
+
+from toml_compat import tomllib
 
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 REQUIRED_ARCHIVE_FILES = (
