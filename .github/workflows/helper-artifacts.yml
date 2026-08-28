@@ -253,6 +253,9 @@ jobs:
         if: runner.os == 'Windows'
         shell: msys2 {0}
         run: |
+          # Keep MSVC link.exe ahead of MSYS2's unrelated GNU link.exe.
+          msvc_tools=$(dirname "$(command -v cl.exe)")
+          export PATH="${msvc_tools}:${PATH}"
           # Later steps use PowerShell, so persist PATH with Windows separators.
           native_bin=$(cygpath -w "${NATIVE_PREFIX}/bin")
           windows_path=$(cygpath -wp "${PATH}")
