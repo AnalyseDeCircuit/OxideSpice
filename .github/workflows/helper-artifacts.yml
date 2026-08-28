@@ -252,7 +252,11 @@ jobs:
       - name: Add Windows native runtime libraries to loader path
         if: runner.os == 'Windows'
         shell: msys2 {0}
-        run: echo "PATH=${NATIVE_PREFIX}/bin:${PATH}" >> "$GITHUB_ENV"
+        run: |
+          # Later steps use PowerShell, so persist PATH with Windows separators.
+          native_bin=$(cygpath -w "${NATIVE_PREFIX}/bin")
+          windows_path=$(cygpath -wp "${PATH}")
+          echo "PATH=${native_bin};${windows_path}" >> "$GITHUB_ENV"
 
       - name: Build full helper
         run: cargo build --release --locked -p oxide-spice-helper --target "${{ matrix.target }}"
