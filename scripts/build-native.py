@@ -189,14 +189,16 @@ def build_libvpx(source: Path, build: Path, prefix: Path, platform: str, archite
     run(command, cwd=build, environment=libvpx_environment)
     make_jobs = os.cpu_count() or 2
     if platform == "windows":
-        # Git Bash keeps upstream shell recipes away from the Windows WSL association.
+        # Windows GNU Make must receive an absolute shell path or it selects WSL.
+        make_shell = git_bash_path.as_posix()
+        make_shell_arguments = (f"SHELL={make_shell}", f"MAKESHELL={make_shell}")
         run(
-            [str(git_bash_path), "-c", f"make SHELL=/bin/bash -j{make_jobs}"],
+            ["make", *make_shell_arguments, f"-j{make_jobs}"],
             cwd=build,
             environment=libvpx_environment,
         )
         run(
-            [str(git_bash_path), "-c", "make SHELL=/bin/bash install"],
+            ["make", *make_shell_arguments, "install"],
             cwd=build,
             environment=libvpx_environment,
         )
