@@ -92,6 +92,15 @@ def git_bash() -> str:
     return str(candidate)
 
 
+def git_bash_path(path: Path) -> str:
+    """Convert an absolute Windows path to Git Bash drive notation."""
+    absolute = str(path.resolve())
+    drive, tail = os.path.splitdrive(absolute)
+    if len(drive) != 2 or drive[1] != ":":
+        raise ValueError(f"Windows path has no drive prefix: {absolute}")
+    return f"/{drive[0].lower()}{tail.replace(chr(92), '/')}"
+
+
 def build_libusb(
     source: Path,
     version: str,
@@ -172,6 +181,8 @@ def build_libvpx(source: Path, build: Path, prefix: Path, platform: str, archite
     elif platform == "macos":
         command.append(f"--target={target_architecture}-darwin24-gcc")
     else:
+        command[0] = git_bash_path(source / "configure")
+        command[1] = f"--prefix={git_bash_path(prefix)}"
         command = [
             git_bash(),
             *command,
