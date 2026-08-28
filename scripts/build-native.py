@@ -109,6 +109,17 @@ endforeach
     # usbredirhost does not use unistd APIs, and MSVC does not provide this header.
     host_source.write_text(host_source_text.replace(unistd_include, ""), encoding="utf-8")
 
+    filter_source = source / "usbredirparser" / "usbredirfilter.c"
+    filter_source_text = filter_source.read_text(encoding="utf-8")
+    windows_guard = "#ifdef WIN32\n"
+    if filter_source_text.count(windows_guard) != 1:
+        raise ValueError("unexpected usbredir Windows guard")
+    # MSVC defines _WIN32, while usbredir only checks the MinGW-style WIN32 alias.
+    filter_source.write_text(
+        filter_source_text.replace(windows_guard, "#ifdef _WIN32\n"),
+        encoding="utf-8",
+    )
+
     for library in ("usbredirparser", "usbredirhost"):
         library_directory = source / library
         version_script = library_directory / f"{library}.map"
