@@ -7,12 +7,17 @@ import argparse
 import hashlib
 import shutil
 import sys
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
 from toml_compat import tomllib
 
 READ_CHUNK_SIZE = 1024 * 1024
+DOWNLOAD_ATTEMPTS = 3
+DOWNLOAD_TIMEOUT_SECONDS = 60
+RETRY_DELAY_SECONDS = 2
 
 
 def sha256(path: Path) -> str:
@@ -32,13 +37,25 @@ def archive_suffix(url: str) -> str:
 
 def fetch(url: str, destination: Path) -> None:
     partial = destination.with_suffix(destination.suffix + ".partial")
-    partial.unlink(missing_ok=True)
-    try:
-        with urllib.request.urlopen(url) as response, partial.open("wb") as output:
-            shutil.copyfileobj(response, output, READ_CHUNK_SIZE)
-        partial.replace(destination)
-    finally:
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
         partial.unlink(missing_ok=True)
+        try:
+            with urllib.request.urlopen(
+                url, timeout=DOWNLOAD_TIMEOUT_SECONDS
+            ) as response, partial.open("wb") as output:
+                shutil.copyfileobj(response, output, READ_CHUNK_SIZE)
+            partial.replace(destination)
+            return
+        except (TimeoutError, urllib.error.URLError):
+            partial.unlink(missing_ok=True)
+            if attempt == DOWNLOAD_ATTEMPTS:
+                raise
+            delay = RETRY_DELAY_SECONDS * attempt
+            print(
+                f"download attempt {attempt} failed for {url}; retrying in {delay} seconds",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
 
 
 def main() -> int:
