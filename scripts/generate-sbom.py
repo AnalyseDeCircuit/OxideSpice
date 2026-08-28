@@ -17,7 +17,7 @@ from toml_compat import tomllib
 
 def timestamp() -> str:
     epoch = int(os.environ.get("SOURCE_DATE_EPOCH", "0"))
-    value = datetime.datetime.fromtimestamp(epoch, datetime.UTC)
+    value = datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc)
     return value.isoformat().replace("+00:00", "Z")
 
 
