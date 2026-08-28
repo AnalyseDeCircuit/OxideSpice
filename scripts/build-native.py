@@ -12,6 +12,9 @@ from pathlib import Path
 
 from toml_compat import tomllib
 
+# libusb 1.0.29 combines public enum flags that newer MSVC versions diagnose.
+MSVC_LIBUSB_MIXED_ENUM_WARNING = "5287"
+
 
 def run(command: list[str], *, cwd: Path | None = None, environment: dict[str, str] | None = None) -> None:
     print("+", " ".join(command), flush=True)
@@ -96,6 +99,7 @@ def build_libusb(
                 "/m",
                 "/p:Configuration=Release-MT",
                 f"/p:Platform={visual_studio_platform}",
+                f"/p:DisableSpecificWarnings={MSVC_LIBUSB_MIXED_ENUM_WARNING}",
             ],
             environment=environment,
         )
