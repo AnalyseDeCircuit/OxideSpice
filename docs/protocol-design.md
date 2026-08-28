@@ -274,7 +274,7 @@ skipping it would produce a plausible but corrupted framebuffer.
 
 ## Crate boundary
 
-The workspace contains four crates:
+The workspace contains five crates:
 
 - `oxide-spice-protocol`: dependency-light byte types, constants, checked parsers, and encoders. It
   contains no I/O runtime, UI, filesystem, or codec implementation.
@@ -283,7 +283,9 @@ The workspace contains four crates:
   without depending on Tokio or client state.
 - `oxide-spice-client`: async transports, link authentication, session/channel ownership, ACK and
   cancellation state, surfaces, and bounded delivery.
-
+- `oxide-spice-helper-protocol`: the pure-Rust, versioned helper IPC schema, bounded JSON/binary
+  codec, pre-credential Hello negotiation, and artifact metadata types. Both the helper and an
+  external host adapter use this crate.
 - `oxide-spice-helper`: the standalone bounded stdio process plus host integrations for USB,
   PC/SC, and local WebDAV filesystem mapping. It exposes only SPICE semantics and remains
   independent of UI frameworks and application-specific host types. The host receives advertised
@@ -296,11 +298,11 @@ The protocol, Ticket, LZ, GLZ, zlib, LZ4, JPEG, QUIC, and H.265 implementations 
 JPEG uses `zune-jpeg`; progressive JPEG uses `jpeg-decoder`; H.265 uses `rust_h265`. Tokio and the
 WebDAV local filesystem backend use Rust OS bindings such as `libc`, but no C SPICE client is linked.
 
-Composite rendering uses the MIT-licensed `pixman`/`pixman-sys` binding and dynamically links the
-system pixman library discovered by `pkg-config`. This native raster boundary implements the
+Composite rendering uses the MIT-licensed `pixman`/`pixman-sys` binding. This native raster boundary implements the
 operation, transform, filter, repeat, component-alpha, clip, and A8 semantics of Draw Composite;
-no SPICE client library is linked. Unix descriptor receipt uses safe `rustix` APIs and keeps all
-project crates under `unsafe_code = "forbid"`.
+no SPICE client library is linked. Official helper artifacts build the pinned Pixman source and
+link it statically. Unix descriptor receipt uses safe `rustix` APIs and keeps all project crates
+under `unsafe_code = "forbid"`.
 
 The client features `composite-pixman`, `audio-opus`, `sasl-gssapi`, `video-h264`, `video-h265`,
 and `video-vpx` select native raster, authentication, and media boundaries. They are enabled by
@@ -310,10 +312,12 @@ to the server. The helper forwards these switches and separately gates `tls-ring
 `smartcard`, and `webdav`. Its IPC schema does not vary with the feature set; a request for a
 backend omitted at build time returns an explicit action error.
 
-SASL password mechanisms are provided by Rust `rsasl`. Enabling `sasl-gssapi` also brings
-`libgssapi`/`libgssapi-sys`, bindgen, and the system Kerberos/GSSAPI library. The native dependency
-is confined to authentication; the SPICE SASL wire framing and optional security-layer record
-framing remain owned by the Rust client.
+SASL password mechanisms are provided by Rust `rsasl`. The Rust-owned RFC 4752 state machine uses
+`cross-krb5`: Linux calls MIT or Heimdal GSSAPI through `libgssapi-sys` and official Linux artifacts
+carry pinned MIT Kerberos; macOS calls the system GSS framework; Windows calls native SSPI Kerberos
+without loading libgssapi. The native boundary is confined to Kerberos context, wrap, and unwrap
+operations; SPICE SASL framing, layer selection, bounds, and record framing remain owned by the
+Rust client.
 
 TLS is an explicit `oxide-spice-client/tls-ring` feature. It disables `tokio-rustls` defaults and
 selects `ring` plus TLS 1.2 support. `ring` compiles bundled C and assembly; that native code is
@@ -327,12 +331,20 @@ Native dependencies are isolated and explicit. `opus 0.4.0` uses `opusic-sys`, w
 BSD-licensed bundled libopus with CMake and may include platform assembly. The helper uses
 `usbredirhost 0.4.1`, transitively linking `usbredirparser-sys` and the system usbredir/libusb
 libraries dynamically when its `usbredir` feature is enabled, and `pcsc 2.9.0`, which uses
-`pcsc-sys` and the platform PC/SC service when `smartcard` is enabled.
+`pcsc-sys` and the platform PC/SC service when `smartcard` is enabled. Linux artifacts build and
+carry the pinned PCSC-Lite client and real delegate libraries; the pcscd socket and daemon remain a
+system service. macOS and Windows use their platform PC/SC implementations.
 usbredir/libusb are dynamically linked LGPL libraries and retain their own distribution terms.
 `oxide-spice-protocol` has none of these dependencies. Display and SpiceVMC LZ4 use safe-Rust
 `lz4_flex`, not `lz4-sys`.
-VP8/VP9 use `vpx-rs -> env-libvpx-sys`, dynamically linking the BSD libvpx discovered by
-`pkg-config`; its build step uses bindgen/libclang. H.264 uses
+VP8/VP9 use `vpx-rs -> env-libvpx-sys`; official artifacts build and statically link the pinned BSD
+libvpx source, and the Rust build uses bindgen/libclang. H.264 uses
 `openh264 -> openh264-sys2`, compiling bundled BSD OpenH264 C++ and assembly. Neither backend enters
 `oxide-spice-protocol`. The helper's Apache-2.0 `dav-server` local filesystem feature uses the Rust
 `libc` crate for platform filesystem calls; it does not bundle a native WebDAV implementation.
+
+Native archive versions, download URLs, hashes, licenses, and linkage policy are recorded in
+`native/dependencies.toml`. The six-target artifact workflow verifies every archive before
+extraction, requires the complete helper capability contract, audits dynamic dependencies, fixes
+relative runtime paths, and packages metadata, license texts, third-party notices, and a CycloneDX
+SBOM. usbredir/libusb remain dynamically replaceable in accordance with their LGPL terms.

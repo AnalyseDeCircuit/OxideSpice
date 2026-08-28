@@ -38,6 +38,7 @@ OxideSpice is licensed under [Apache-2.0](LICENSE).
 | `oxide-spice-protocol` | Dependency-light wire constants, semantic types, checked parsers, and encoders. No I/O runtime or native dependency. |
 | `oxide-spice-codecs` | Bounded image, video, and audio codec implementations and adapters. |
 | `oxide-spice-client` | Async transports, authentication, sessions, channels, surfaces, migration, and cancellation. No UI framework dependency. |
+| `oxide-spice-helper-protocol` | Versioned, bounded helper IPC types and codecs shared with host applications. Pure Rust with no native dependency. |
 | `oxide-spice-helper` | Standalone stdio process plus host-owned WebDAV, USB/libusb, and PC/SC integrations. |
 
 OxideSpice does not depend on a UI framework or application-specific host types.
@@ -49,25 +50,25 @@ boundaries intentionally use native code:
 
 | Boundary | Dependency model |
 | --- | --- |
-| Draw Composite | System `pixman` through `pixman-sys` and `pkg-config`. |
+| Draw Composite | `pixman` through `pixman-sys`; official helper artifacts build the pinned source statically. |
 | TLS | `ring`, which builds bundled C and assembly when `tls-ring` is enabled. |
-| SASL GSSAPI | System Kerberos/GSSAPI through `libgssapi-sys`. |
+| SASL GSSAPI | MIT/Heimdal GSSAPI on Linux, the system GSS framework on macOS, and native SSPI Kerberos on Windows. |
 | Opus | Bundled BSD-licensed libopus through `opusic-sys` and CMake. |
 | H.264 | Bundled BSD OpenH264 C++ and assembly. |
-| VP8/VP9 | System libvpx through `env-libvpx-sys`, `pkg-config`, and bindgen. |
+| VP8/VP9 | Pinned libvpx through `env-libvpx-sys` and bindgen; official helper artifacts link it statically. |
 | USB redirection | Dynamic usbredir/libusb through `usbredirhost`. |
-| Smartcard | Platform PC/SC through `pcsc-sys`. |
+| Smartcard | `pcsc-sys`; Linux artifacts bundle the pinned PCSC-Lite client library while the daemon remains a system service. macOS and Windows use their platform PC/SC APIs. |
 
 No native SPICE client library is linked. See the
 [dependency policy](docs/protocol-design.md#dependency-policy) for details and license boundaries.
 
 ## Build requirements
 
-- A stable Rust toolchain with Rust 2024 edition support.
+- Rust 1.94.1 as selected by `rust-toolchain.toml`.
 - A C/C++ toolchain and CMake for bundled native codecs and cryptography.
 - `pkg-config` and libclang/bindgen support where required.
-- Development packages for pixman, libvpx, Kerberos/GSSAPI, usbredir/libusb, and PC/SC when building
-  the crates that use those integrations.
+- Development packages for pixman, libvpx, Kerberos/GSSAPI, usbredir/libusb, and PC/SC for ordinary
+  local builds, or the pinned native-source pipeline in `scripts/` for artifact builds.
 
 `oxide-spice-client` enables `composite-pixman`, `audio-opus`, `sasl-gssapi`, `video-h264`,
 `video-h265`, and `video-vpx` by default. Each boundary can be disabled independently. A
@@ -75,11 +76,10 @@ no-default-features build retains the Rust wire stack, password-based SASL, clas
 codecs, raw audio, and MJPEG without linking pixman, GSSAPI, libopus, OpenH264, libvpx, or the H.265
 decoder.
 
-`oxide-spice-helper` forwards those client feature switches and separately gates `tls-ring`,
-`usbredir`, `smartcard`, and `webdav`. Its defaults enable the complete helper. Building it with
-`--no-default-features` retains the stable stdio protocol and core session path without the optional
-transport-security, media, raster, device, or filesystem backends; requests for an omitted host
-integration fail explicitly at runtime.
+`oxide-spice-helper` defaults to the complete integration set. Official artifacts require that
+default set and reject a binary whose Hello capability list is missing TLS, Kerberos, Pixman, media,
+clipboard, file transfer, WebDAV, USBredir, smartcard, or multi-display support. Feature-reduced
+builds are development tools and are not release artifacts.
 
 The protocol crate can be built independently without those native packages:
 
@@ -91,12 +91,6 @@ Build the complete workspace with:
 
 ```sh
 cargo build --workspace --all-features
-```
-
-Build the dependency-minimal helper with:
-
-```sh
-cargo build -p oxide-spice-helper --no-default-features
 ```
 
 ## Library quick start
@@ -150,12 +144,40 @@ chunks, and Port data. It exposes:
 - Playback/Record data and settings plus ordinary Port byte streams;
 - explicit WebDAV directory authorization and helper-owned USB/PCSC discovery.
 
+The first request is a credential-free `Hello`. The helper flushes `HelloAck` with its IPC version,
+helper version, target triple, and complete compiled capability list before it accepts `Connect` or
+reads Ticket and SASL credentials. Host adapters should depend on `oxide-spice-helper-protocol`
+rather than duplicating the wire structures.
+
 The stdio helper disables GL scanout because stdin/stdout cannot carry DMA-BUF file descriptors.
 Applications that need zero-copy scanout can use the client API directly or provide an explicit
 Unix descriptor side channel.
 
 See the [helper IPC contract](docs/helper-ipc.md) for framing, limits, ordering, and request/event
 semantics.
+
+## Precompiled helper artifacts
+
+`Full helper artifacts` builds macOS, Linux, and Windows for x86-64 and ARM64 from the pinned native
+source manifest. Each archive contains the helper, replaceable usbredir/libusb libraries, the Linux
+PCSC-Lite client library where applicable,
+`helper-metadata.json`, a CycloneDX SBOM, license texts, and third-party notices. Linux and macOS
+artifacts use relative runtime paths; Windows DLLs are placed beside the executable. Manually
+dispatched branch builds remain unsigned temporary candidates.
+
+Permanent releases use an existing `v<workspace-version>` tag that points to a commit contained in
+`main`. Dispatch `Full helper artifacts` with that tag selected as the workflow ref. The workflow
+rebuilds all six targets from the tagged commit, signs every SHA-256 file in the protected
+`helper-signing` environment, validates the complete asset and metadata contract, and creates a
+GitHub Release without replacing an existing release or asset. The workflow never creates tags.
+
+Release signing requires the following repository settings:
+
+- `helper-signing` environment secret `MINISIGN_SECRET_KEY`, containing an unencrypted Minisign
+  secret key generated with `minisign -G -W`;
+- repository Actions variable `MINISIGN_PUBLIC_KEY`, containing the single `RW...` public-key line;
+- a `helper-signing` deployment rule that permits only version tags such as `v*`; required reviewers
+  are recommended for the signing environment.
 
 ## Verification
 

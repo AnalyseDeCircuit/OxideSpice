@@ -6,9 +6,12 @@
 events from stdout. Diagnostic text is written only to stderr. The contract contains SPICE domain
 types and has no dependency on a UI framework or application-specific host types.
 
-The first request must be `Connect`. EOF or `Close` begins orderly shutdown. The helper then stops
-native integrations, shuts down every SPICE channel task, emits `closing` and `disconnected`
-statuses, drains the event writer, and exits.
+The first request must be `Hello`, which contains no credentials. The helper writes and flushes a
+`HelloAck` before its input reader is allowed to read `Connect`. An incompatible IPC version,
+duplicate requirement, or missing compiled capability terminates the process without reading a
+Ticket or SASL credential. Direct `Connect` as the first request is invalid. EOF or `Close` begins
+orderly shutdown. The helper then stops native integrations, shuts down every SPICE channel task,
+emits `closing` and `disconnected` statuses, drains the event writer, and exits.
 
 ## Framing and limits
 
@@ -25,11 +28,22 @@ length mismatches.
 
 Passwords and Tickets are redacted from Rust debug output and their owned allocations are cleared
 when dropped. TLS accepts caller-supplied DER trust anchors and a required server name. SASL accepts
-GSSAPI or password credentials; enabling GSSAPI uses the disclosed system GSSAPI boundary.
+GSSAPI or password credentials. GSSAPI uses MIT/Heimdal on Linux, the system GSS framework on
+macOS, and native SSPI Kerberos on Windows.
 
 ## Connection sequence
 
-A plain TCP connection starts with:
+A host that requires the complete helper starts with:
+
+```json
+{"type":"hello","hello":{"protocolVersion":1,"requiredCapabilities":["core-session","tls","sasl-password","sasl-gssapi","display-canvas","composite-pixman","audio-raw","audio-opus","video-mjpeg","video-vp8","video-vp9","video-h264","video-h265","clipboard","file-transfer","web-dav","usb-redir","smartcard","multi-display","playback","record","port"]}}
+```
+
+The first event is `helloAck`. Its `compatible` field must be true, and its protocol version and
+capability list must be checked before the host sends the following `Connect` request. `helperVersion`
+and `target` identify the launched binary. A rejected acknowledgement includes a typed reason.
+
+A plain TCP `Connect` then uses:
 
 ```json
 {"type":"connect","options":{"endpoint":{"type":"tcp","host":"127.0.0.1","port":5900},"ticket":"","transportSecurity":{"type":"plain"},"sasl":null}}
@@ -77,7 +91,9 @@ a bounded byte bridge for each one automatically. `portState`, `PortDataBinary`,
 carry server-to-host state and data; `PortWriteBinary` and `PortBreak` carry the reverse direction.
 The 256 KiB SPICE Port message bound is enforced before allocating a declared binary payload.
 
-- `ListNativeDevices` returns `nativeDevices` with libusb identities and PC/SC display names.
+- `ListNativeDevices` returns `nativeDevices` with libusb identities and PC/SC display names. Its
+  independent `usbStatus` and `smartcardStatus` fields report `available` or a structured
+  `unavailable` reason, so a missing PC/SC service does not hide USB results.
 - `StartWebDav` grants one advertised WebDAV channel access to one local directory and explicitly
   selects read-only or read-write methods.
 - `StartUsbRedirection` pairs one advertised USBredir channel with one enumerated bus/address and

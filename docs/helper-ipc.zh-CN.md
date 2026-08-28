@@ -6,9 +6,11 @@
 输出读取事件；诊断信息只写入标准错误。该契约只包含 SPICE 领域类型，不依赖 UI 框架
 或宿主应用的专用类型。
 
-第一个请求必须是 `Connect`。输入结束或收到 `Close` 后，helper 开始有序关闭：停止
-原生集成、关闭全部 SPICE 通道任务、发送 `closing` 和 `disconnected` 状态、排空事件
-写入器，然后退出。
+第一个请求必须是不含凭据的 `Hello`。helper 会先写出并刷新 `HelloAck`，输入读取器才会
+继续读取 `Connect`。IPC 版本不兼容、需求重复或缺少编译能力时，进程会在读取 Ticket 或
+SASL 凭据前退出。第一条请求直接发送 `Connect` 属于协议错误。输入结束或收到 `Close`
+后，helper 开始有序关闭：停止原生集成、关闭全部 SPICE 通道任务、发送 `closing` 和
+`disconnected` 状态、排空事件写入器，然后退出。
 
 ## 帧格式与限制
 
@@ -22,12 +24,23 @@ JSON 上限为 1 MiB。较大的帧、光标、剪贴板和 PCM 数据使用 JSO
 解码器会拒绝算术溢出、超限值、截断负载以及元数据与负载长度不一致的消息。
 
 密码和 Ticket 不会出现在 Rust 调试输出中，所持有的内存在释放时会清零。TLS 接收由
-调用方提供的 DER 信任锚和必填服务器名称。SASL 支持 GSSAPI 或密码凭据；启用 GSSAPI
-时会使用已披露的系统 GSSAPI 边界。
+调用方提供的 DER 信任锚和必填服务器名称。SASL 支持 GSSAPI 或密码凭据。GSSAPI 在
+Linux 使用 MIT/Heimdal，在 macOS 使用系统 GSS framework，在 Windows 使用原生 SSPI
+Kerberos。
 
 ## 连接顺序
 
-普通 TCP 连接从以下请求开始：
+要求完整 helper 的宿主先发送：
+
+```json
+{"type":"hello","hello":{"protocolVersion":1,"requiredCapabilities":["core-session","tls","sasl-password","sasl-gssapi","display-canvas","composite-pixman","audio-raw","audio-opus","video-mjpeg","video-vp8","video-vp9","video-h264","video-h265","clipboard","file-transfer","web-dav","usb-redir","smartcard","multi-display","playback","record","port"]}}
+```
+
+第一条事件是 `helloAck`。宿主必须确认 `compatible` 为 true，并检查协议版本和能力清单，
+然后才能发送下面的 `Connect`。`helperVersion` 与 `target` 用于识别当前二进制；拒绝响应
+会包含类型化原因。
+
+普通 TCP 的 `Connect` 请求如下：
 
 ```json
 {"type":"connect","options":{"endpoint":{"type":"tcp","host":"127.0.0.1","port":5900},"ticket":"","transportSecurity":{"type":"plain"},"sasl":null}}
@@ -71,6 +84,8 @@ Port 建立有界字节桥。`portState`、`PortDataBinary` 和 `portBreak` 承�
 先检查 SPICE Port 的 256 KiB 消息上限。
 
 - `ListNativeDevices` 返回 `nativeDevices`，其中包含 libusb 设备标识和 PC/SC 显示名称。
+  独立的 `usbStatus` 与 `smartcardStatus` 会报告 `available` 或带原因的 `unavailable`，
+  PC/SC 服务缺失不会再隐藏 USB 枚举结果。
 - `StartWebDav` 授权一个已发布的 WebDAV 通道访问一个本地目录，并显式选择只读或读写
   方法。
 - `StartUsbRedirection` 将一个已发布的 USBredir 通道与枚举所得的总线号、设备地址、

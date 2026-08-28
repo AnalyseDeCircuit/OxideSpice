@@ -246,7 +246,7 @@ token 对应一个 Main AgentData 分片，而不是一个逻辑 Agent 消息。
 
 ## Crate 边界
 
-workspace 包含四个 crate：
+workspace 包含五个 crate：
 
 - `oxide-spice-protocol`：依赖精简的字节类型、常量、安全解析器和编码器，不包含 I/O
   运行时、UI、文件系统或 codec 实现。
@@ -255,6 +255,8 @@ workspace 包含四个 crate：
   支持协作取消。
 - `oxide-spice-client`：异步传输、Link 认证、session/channel 所有权、ACK、取消状态、
   surface 和有界交付。
+- `oxide-spice-helper-protocol`：纯 Rust 的版本化 helper IPC schema、有界 JSON/二进制
+  编解码、凭据前 Hello 协商和制品元数据类型。helper 与外部宿主适配器共同使用该 crate。
 - `oxide-spice-helper`：独立有界 stdio 进程，以及 USB、PC/SC 和本地 WebDAV 文件系统
   映射。只暴露 SPICE 语义，不依赖 UI 框架或宿主应用专用类型。宿主先取得已发布通道
   ID，再授予目录或设备权限；原生设备发现保留在 helper 进程内。
@@ -265,19 +267,22 @@ workspace 包含四个 crate：
 使用 `zune-jpeg`，progressive JPEG 使用 `jpeg-decoder`，H.265 使用 `rust_h265`。Tokio
 和 WebDAV 本地文件系统后端使用 `libc` 等 Rust OS binding，但不会链接 C SPICE 客户端。
 
-Composite 渲染使用 MIT 许可证的 `pixman`/`pixman-sys` binding，通过 `pkg-config` 动态
-链接系统 pixman。该原生光栅边界实现 Draw Composite 的 operation、transform、filter、
-repeat、component-alpha、clip 和 A8 语义，不链接 SPICE 客户端库。Unix 描述符接收使用
-safe `rustix` API，所有项目 crate 均保持 `unsafe_code = "forbid"`。
+Composite 渲染使用 MIT 许可证的 `pixman`/`pixman-sys` binding。该原生光栅边界实现
+Draw Composite 的 operation、transform、filter、repeat、component-alpha、clip 和 A8
+语义，不链接 SPICE 客户端库。正式 helper 制品会构建固定版本的 Pixman 源码并静态
+链接。Unix 描述符接收使用 safe `rustix` API，所有项目 crate 均保持
+`unsafe_code = "forbid"`。
 
 客户端通过 `composite-pixman`、`audio-opus`、`sasl-gssapi`、`video-h264`、
 `video-h265` 和 `video-vpx` 功能选择原生光栅、认证与媒体边界。完整客户端默认启用
 它们，也可逐项关闭。能力发布从实际编译功能推导；被关闭的 codec 或 Composite
 backend 不会向服务端发布。
 
-SASL 密码机制由 Rust `rsasl` 提供。启用 `sasl-gssapi` 还会引入
-`libgssapi`/`libgssapi-sys`、bindgen 和系统 Kerberos/GSSAPI 库。原生依赖只位于认证
-边界；SPICE SASL 帧和可选 security-layer record frame 仍由 Rust 客户端持有。
+SASL 密码机制由 Rust `rsasl` 提供。Rust 实现的 RFC 4752 状态机通过 `cross-krb5`
+调用平台能力：Linux 经 `libgssapi-sys` 使用 MIT 或 Heimdal GSSAPI，正式 Linux 制品
+携带固定版本的 MIT Kerberos；macOS 使用系统 GSS framework；Windows 直接使用原生
+SSPI Kerberos，不加载 libgssapi。原生边界只负责 Kerberos context、wrap 和 unwrap；
+SPICE SASL 帧、层选择、边界检查和 record frame 仍由 Rust 客户端持有。
 
 TLS 是显式的 `oxide-spice-client/tls-ring` 功能。它关闭 `tokio-rustls` 默认功能，选择
 `ring` 和 TLS 1.2。`ring` 会编译随包 C 与汇编代码；这些原生代码只位于传输密码学边界，
@@ -293,13 +298,21 @@ helper 会转发上述开关，并分别用 `tls-ring`、`usbredir`、`smartcard
 原生依赖保持隔离并显式披露。`opus 0.4.0` 使用 `opusic-sys`，通过 CMake 编译采用 BSD
 许可证、随包提供且可能包含平台汇编的 libopus。helper 使用 `usbredirhost 0.4.1`，间接
 动态链接 `usbredirparser-sys` 和系统 usbredir/libusb，此路径由 `usbredir` 功能控制；
-`pcsc 2.9.0` 通过 `pcsc-sys` 使用平台 PC/SC 服务，此路径由 `smartcard` 功能控制。
+`pcsc 2.9.0` 通过 `pcsc-sys` 使用平台 PC/SC 服务，此路径由 `smartcard` 功能控制。Linux
+制品会构建并携带固定版本的 PCSC-Lite 客户端库与 real delegate 库，pcscd socket 和
+daemon 仍由系统提供；macOS 与 Windows 使用平台 PC/SC 实现。
 usbredir/libusb 是动态链接的 LGPL 库，并保留自身分发条款。
 `oxide-spice-protocol` 不包含这些依赖。Display 和 SpiceVMC LZ4 使用 safe Rust
 `lz4_flex`，不使用 `lz4-sys`。
 
-VP8/VP9 使用 `vpx-rs -> env-libvpx-sys`，通过 `pkg-config` 动态链接采用 BSD 许可证的
-libvpx；其构建步骤使用 bindgen/libclang。H.264 使用 `openh264 -> openh264-sys2`，编译
+VP8/VP9 使用 `vpx-rs -> env-libvpx-sys`；正式制品会构建并静态链接固定版本、采用 BSD
+许可证的 libvpx，其 Rust 构建步骤使用 bindgen/libclang。H.264 使用
+`openh264 -> openh264-sys2`，编译
 随包提供、采用 BSD 许可证的 OpenH264 C++ 和汇编。两者都不会进入
 `oxide-spice-protocol`。helper 的 Apache-2.0 `dav-server` 本地文件系统功能使用 Rust
 `libc` crate 进行平台文件系统调用，不会随包提供原生 WebDAV 实现。
+
+`native/dependencies.toml` 记录原生归档的版本、下载地址、散列、许可证和链接策略。
+六目标制品工作流会在解压前校验每个归档，要求完整 helper 能力契约，审计动态依赖，
+修正相对运行时路径，并打包元数据、许可证文本、第三方声明和 CycloneDX SBOM。
+usbredir/libusb 继续采用可替换的动态链接方式，以保留 LGPL 要求的替换能力。

@@ -37,6 +37,7 @@ OxideSpice 使用 [Apache-2.0](LICENSE) 许可证。
 | `oxide-spice-protocol` | 依赖精简的协议常量、语义类型、安全解析器和编码器；不包含 I/O 运行时或原生依赖。 |
 | `oxide-spice-codecs` | 有界的图像、视频和音频编解码实现及适配器。 |
 | `oxide-spice-client` | 异步传输、认证、会话、通道、表面、迁移和取消；不依赖 UI 框架。 |
+| `oxide-spice-helper-protocol` | 供 helper 与宿主应用共享的版本化有界 IPC 类型和编解码器；纯 Rust 且无原生依赖。 |
 | `oxide-spice-helper` | 独立 stdio 进程，以及由宿主持有权限的 WebDAV、USB/libusb 和 PC/SC 集成。 |
 
 OxideSpice 不依赖 UI 框架或宿主应用的专用类型。
@@ -48,36 +49,34 @@ SPICE 字节协议始终由 Rust 代码管理。部分生产级编解码、光�
 
 | 边界 | 依赖方式 |
 | --- | --- |
-| Draw Composite | 通过 `pixman-sys` 和 `pkg-config` 动态使用系统 pixman。 |
+| Draw Composite | 通过 `pixman-sys` 使用 pixman；正式 helper 制品会静态链接固定源码版本。 |
 | TLS | 启用 `tls-ring` 时由 `ring` 编译随包提供的 C 和汇编代码。 |
-| SASL GSSAPI | 通过 `libgssapi-sys` 使用系统 Kerberos/GSSAPI。 |
+| SASL GSSAPI | Linux 使用 MIT/Heimdal GSSAPI，macOS 使用系统 GSS framework，Windows 使用原生 SSPI Kerberos。 |
 | Opus | 通过 `opusic-sys` 和 CMake 编译随包提供、采用 BSD 许可证的 libopus。 |
 | H.264 | 编译随包提供、采用 BSD 许可证的 OpenH264 C++ 和汇编代码。 |
-| VP8/VP9 | 通过 `env-libvpx-sys`、`pkg-config` 和 bindgen 使用系统 libvpx。 |
+| VP8/VP9 | 通过 `env-libvpx-sys` 和 bindgen 使用固定版本 libvpx；正式 helper 制品静态链接。 |
 | USB 重定向 | 通过 `usbredirhost` 动态使用 usbredir/libusb。 |
-| 智能卡 | 通过 `pcsc-sys` 使用平台 PC/SC 服务。 |
+| 智能卡 | 通过 `pcsc-sys` 使用 PC/SC；Linux 制品携带固定版本的 PCSC-Lite 客户端库，daemon 仍由系统提供；macOS 与 Windows 使用平台 PC/SC API。 |
 
 项目不会链接任何原生 SPICE 客户端库。详细信息和许可证边界见
 [依赖策略](docs/protocol-design.zh-CN.md#依赖策略)。
 
 ## 构建要求
 
-- 支持 Rust 2024 edition 的稳定版 Rust 工具链。
+- `rust-toolchain.toml` 指定的 Rust 1.94.1 工具链。
 - 用于随包原生编解码器和密码学实现的 C/C++ 工具链与 CMake。
 - `pkg-config`，以及相关依赖需要的 libclang/bindgen 环境。
-- 构建对应 crate 时，需要 pixman、libvpx、Kerberos/GSSAPI、usbredir/libusb 和 PC/SC
-  开发包。
+- 普通本机构建需要 pixman、libvpx、Kerberos/GSSAPI、usbredir/libusb 和 PC/SC 开发包；
+  制品构建也可以使用 `scripts/` 中固定源码版本的构建流程。
 
 `oxide-spice-client` 默认启用 `composite-pixman`、`audio-opus`、`sasl-gssapi`、
 `video-h264`、`video-h265` 和 `video-vpx`，每个边界都可以独立关闭。关闭全部默认功能
 后，Rust 字节协议栈、基于密码的 SASL、经典 Canvas、图像编解码、原始音频和 MJPEG
 仍然可用，同时不链接 pixman、GSSAPI、libopus、OpenH264、libvpx 或 H.265 decoder。
 
-`oxide-spice-helper` 会转发这些客户端功能开关，并分别用 `tls-ring`、`usbredir`、
-`smartcard` 和 `webdav` 控制宿主集成。默认构建启用完整 helper；使用
-`--no-default-features` 时，稳定的标准输入输出协议和核心会话路径仍然保留，但不引入
-可选传输安全、媒体、光栅、设备和文件系统后端。宿主若请求未编译的集成，会收到明确
-的运行时错误。
+`oxide-spice-helper` 默认启用完整集成集合。正式制品会校验 Hello 能力清单；缺少 TLS、
+Kerberos、Pixman、媒体、剪贴板、文件传输、WebDAV、USBredir、智能卡或多显示器中的
+任何一项都会拒绝打包。裁剪功能的构建只用于开发，不属于正式制品。
 
 协议 crate 不需要上述原生软件包，可以独立构建：
 
@@ -89,12 +88,6 @@ cargo build -p oxide-spice-protocol
 
 ```sh
 cargo build --workspace --all-features
-```
-
-构建依赖最少的 helper：
-
-```sh
-cargo build -p oxide-spice-helper --no-default-features
 ```
 
 ## 客户端快速开始
@@ -146,10 +139,36 @@ cargo run -p oxide-spice-helper -- --stdio
 - Playback/Record 数据与设置，以及普通 Port 字节流；
 - 显式 WebDAV 目录授权，以及由 helper 管理的 USB/PCSC 设备发现。
 
+第一条请求必须是不含凭据的 `Hello`。helper 会先写出并刷新 `HelloAck`，其中包含 IPC
+版本、helper 版本、目标三元组和完整编译能力；之后才会接受 `Connect` 并读取 Ticket 或
+SASL 凭据。宿主适配器应直接依赖 `oxide-spice-helper-protocol`，不应复制 IPC 结构。
+
 stdio helper 不启用 GL scanout，因为标准输入输出无法传递 DMA-BUF 文件描述符。需要
 零复制 scanout 的应用可以直接使用客户端接口，或提供明确的 Unix 文件描述符旁路。
 
 帧格式、限制、顺序和请求/事件语义见 [helper IPC 契约](docs/helper-ipc.zh-CN.md)。
+
+## 预编译 helper 制品
+
+`Full helper artifacts` 工作流会使用固定的原生源码清单，为 macOS、Linux 和 Windows
+分别构建 x86-64 与 ARM64 制品。每个压缩包都包含 helper、可替换的 usbredir/libusb
+动态库，以及 Linux 平台需要的 PCSC-Lite 客户端库、`helper-metadata.json`、CycloneDX
+SBOM、许可证文本和第三方声明。Linux 与
+macOS 使用相对运行时路径，Windows DLL 与可执行文件放在同一目录。手动触发的候选制品
+保持为未签名的临时制品。
+
+永久发布必须使用已经存在的 `v<workspace-version>` 标签，且标签提交必须包含在 `main`
+中。运行 `Full helper artifacts` 时，需要选择该标签作为工作流引用。工作流会从标签提交
+重新构建六个目标，在受保护的 `helper-signing` environment 中签署每个 SHA-256 文件，
+校验完整资产集合和元数据契约，然后创建 GitHub Release；已经存在的 Release 或同名资产
+不会被覆盖。工作流不会创建标签。
+
+发布签名需要配置以下仓库设置：
+
+- 在 `helper-signing` environment 中添加 secret `MINISIGN_SECRET_KEY`，内容为通过
+  `minisign -G -W` 生成的无密码 Minisign 私钥；
+- 添加仓库级 Actions variable `MINISIGN_PUBLIC_KEY`，内容为单行 `RW...` 公钥；
+- 为 `helper-signing` 设置仅允许 `v*` 等版本标签的部署规则，并建议配置签名审批人。
 
 ## 检查与测试
 
