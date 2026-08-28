@@ -13,8 +13,10 @@ from pathlib import Path
 from toml_compat import tomllib
 
 
-def command_output(command: list[str]) -> str:
-    return subprocess.check_output(command, text=True, stderr=subprocess.STDOUT)
+def command_output(command: list[str], *, encoding: str | None = None) -> str:
+    return subprocess.check_output(
+        command, text=True, encoding=encoding, stderr=subprocess.STDOUT
+    )
 
 
 def binary_dependencies(path: Path, platform: str) -> list[str]:
@@ -121,7 +123,16 @@ def target_config(manifest: Path, triple: str) -> dict:
 def copy_cargo_licenses(destination: Path, target: str) -> None:
     metadata = json.loads(
         command_output(
-            ["cargo", "metadata", "--locked", "--format-version", "1", "--filter-platform", target]
+            [
+                "cargo",
+                "metadata",
+                "--locked",
+                "--format-version",
+                "1",
+                "--filter-platform",
+                target,
+            ],
+            encoding="utf-8",
         )
     )
     package_by_id = {package["id"]: package for package in metadata["packages"]}
@@ -168,7 +179,11 @@ def main() -> int:
 
     config = target_config(arguments.targets, arguments.target)
     expected_capabilities = sorted(json.loads(arguments.capabilities.read_text(encoding="utf-8")))
-    metadata = json.loads(command_output([str(arguments.helper), "--print-build-metadata"]))
+    metadata = json.loads(
+        command_output(
+            [str(arguments.helper), "--print-build-metadata"], encoding="utf-8"
+        )
+    )
     if metadata["target"] != arguments.target:
         raise SystemExit(f"helper target mismatch: expected {arguments.target}, got {metadata['target']}")
     if sorted(metadata["capabilities"]) != expected_capabilities:

@@ -28,7 +28,9 @@ def main() -> int:
     locked_versions = {(package["name"], package["version"]) for package in lockfile["package"]}
     cargo_metadata = json.loads(
         subprocess.check_output(
-            ["cargo", "metadata", "--locked", "--format-version", "1"], text=True
+            ["cargo", "metadata", "--locked", "--format-version", "1"],
+            text=True,
+            encoding="utf-8",
         )
     )
     package_metadata = {

@@ -34,7 +34,10 @@ def main() -> int:
     artifact_metadata = json.loads((arguments.directory / "helper-metadata.json").read_text(encoding="utf-8"))
     embedded_metadata = json.loads(
         subprocess.check_output(
-            [str(executable), "--print-build-metadata"], text=True, env=environment
+            [str(executable), "--print-build-metadata"],
+            text=True,
+            encoding="utf-8",
+            env=environment,
         )
     )
     subprocess.run([str(executable), "--check-native-loads"], check=True, env=environment)
@@ -54,6 +57,7 @@ def main() -> int:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
         env=environment,
     )
     assert process.stdin is not None

@@ -48,6 +48,7 @@ def main() -> int:
                 arguments.target,
             ],
             text=True,
+            encoding="utf-8",
         )
     )
     package_by_id = {package["id"]: package for package in metadata["packages"]}
