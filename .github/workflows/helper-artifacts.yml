@@ -227,13 +227,16 @@ jobs:
       - name: Build pinned native dependencies with MSYS2
         if: runner.os == 'Windows'
         shell: msys2 {0}
-        run: >-
-          python scripts/build-native.py
-          --archives "${{ env.NATIVE_ARCHIVES }}"
-          --work "${{ env.NATIVE_WORK }}"
-          --prefix "${{ env.NATIVE_PREFIX }}"
-          --platform "${{ matrix.platform }}"
-          --architecture "${{ matrix.architecture }}"
+        run: |
+          # MSYS2 also ships link.exe, so keep the active MSVC tool directory first.
+          msvc_tools=$(dirname "$(command -v cl.exe)")
+          export PATH="${msvc_tools}:${PATH}"
+          python scripts/build-native.py \
+            --archives "${{ env.NATIVE_ARCHIVES }}" \
+            --work "${{ env.NATIVE_WORK }}" \
+            --prefix "${{ env.NATIVE_PREFIX }}" \
+            --platform "${{ matrix.platform }}" \
+            --architecture "${{ matrix.architecture }}"
 
       - name: Add native runtime libraries to loader path
         if: runner.os != 'Windows'
