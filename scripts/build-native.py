@@ -185,7 +185,7 @@ def build_libvpx(source: Path, build: Path, prefix: Path, platform: str, archite
     if platform == "windows":
         # The generated solution exposes both configurations, but packaging only needs Release.
         visual_studio_platform = "x64" if architecture == "x86_64" else "ARM64"
-        solution_make_target = f"target=solution-{visual_studio_toolchain}"
+        solution_make_target = "target=solution"
         run(
             [make_executable, solution_make_target, "vpx.sln.mk"],
             cwd=build,
