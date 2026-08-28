@@ -289,9 +289,11 @@ def build_libvpx(source: Path, build: Path, prefix: Path, platform: str, archite
         run([make_executable, f"-j{make_jobs}"], cwd=build, environment=libvpx_environment)
         run([make_executable, "install"], cwd=build, environment=libvpx_environment)
     if platform == "windows":
-        installed_library = prefix / "lib" / "vpx.lib"
-        if installed_library.is_file():
-            shutil.copy2(installed_library, prefix / "lib" / "libvpx.lib")
+        installed_library = prefix / "lib" / visual_studio_platform / "vpxmt.lib"
+        if not installed_library.is_file():
+            raise FileNotFoundError(f"installed libvpx library not found: {installed_library}")
+        # env-libvpx-sys requests libvpx.lib for static Windows builds.
+        shutil.copy2(installed_library, prefix / "lib" / "libvpx.lib")
 
 
 def build_kerberos(source: Path, build: Path, prefix: Path, environment: dict[str, str]) -> None:
