@@ -178,9 +178,6 @@ def build_libvpx(source: Path, build: Path, prefix: Path, platform: str, archite
         libvpx_environment["PATH"] = os.pathsep.join(
             (str(git_bash_path.parent), libvpx_environment["PATH"])
         )
-        # Native GNU Make otherwise resolves libvpx's shell scripts through WSL.
-        libvpx_environment["SHELL"] = str(git_bash_path)
-        libvpx_environment["MAKESHELL"] = str(git_bash_path)
         command[0] = Path(os.path.relpath(source / "configure", build)).as_posix()
         command[1] = f"--prefix={prefix.resolve().as_posix()}"
         command = [
@@ -190,8 +187,22 @@ def build_libvpx(source: Path, build: Path, prefix: Path, platform: str, archite
             "--enable-static-msvcrt",
         ]
     run(command, cwd=build, environment=libvpx_environment)
-    run(["make", f"-j{os.cpu_count() or 2}"], cwd=build, environment=libvpx_environment)
-    run(["make", "install"], cwd=build, environment=libvpx_environment)
+    make_jobs = os.cpu_count() or 2
+    if platform == "windows":
+        # Git Bash keeps upstream shell recipes away from the Windows WSL association.
+        run(
+            [str(git_bash_path), "-c", f"SHELL=/bin/bash make -j{make_jobs}"],
+            cwd=build,
+            environment=libvpx_environment,
+        )
+        run(
+            [str(git_bash_path), "-c", "SHELL=/bin/bash make install"],
+            cwd=build,
+            environment=libvpx_environment,
+        )
+    else:
+        run(["make", f"-j{make_jobs}"], cwd=build, environment=libvpx_environment)
+        run(["make", "install"], cwd=build, environment=libvpx_environment)
     if platform == "windows":
         installed_library = prefix / "lib" / "vpx.lib"
         if installed_library.is_file():
