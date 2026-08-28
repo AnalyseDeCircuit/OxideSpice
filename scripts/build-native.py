@@ -181,20 +181,34 @@ def build_libvpx(source: Path, build: Path, prefix: Path, platform: str, archite
         ]
     run(command, cwd=build, environment=libvpx_environment)
     make_jobs = os.cpu_count() or 2
-    make_arguments = [make_executable, f"-j{make_jobs}"]
     if platform == "windows":
-        # The generated solution exposes both configurations, but packaging only needs Release.
-        visual_studio_platform = "x64" if architecture == "x86_64" else "ARM64"
-        solution_make_target = "target=solution"
+        # Generate the Visual Studio solution without launching its Debug and Release targets.
         run(
-            [make_executable, solution_make_target, "vpx.sln.mk"],
+            [make_executable, "NO_LAUNCH_DEVENV=1", f"-j{make_jobs}"],
             cwd=build,
             environment=libvpx_environment,
         )
-        make_arguments.append(solution_make_target)
-        make_arguments.append(f"Release_{visual_studio_platform}")
-    run(make_arguments, cwd=build, environment=libvpx_environment)
-    run([make_executable, "install"], cwd=build, environment=libvpx_environment)
+        visual_studio_platform = "x64" if architecture == "x86_64" else "ARM64"
+        run(
+            [
+                "msbuild",
+                str(build / "vpx.sln"),
+                "/m",
+                "/t:Build",
+                "/p:Configuration=Release",
+                f"/p:Platform={visual_studio_platform}",
+            ],
+            cwd=build,
+            environment=libvpx_environment,
+        )
+        run(
+            [make_executable, "NO_LAUNCH_DEVENV=1", "install"],
+            cwd=build,
+            environment=libvpx_environment,
+        )
+    else:
+        run([make_executable, f"-j{make_jobs}"], cwd=build, environment=libvpx_environment)
+        run([make_executable, "install"], cwd=build, environment=libvpx_environment)
     if platform == "windows":
         installed_library = prefix / "lib" / "vpx.lib"
         if installed_library.is_file():
