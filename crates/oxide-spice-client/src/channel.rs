@@ -12,6 +12,7 @@ use oxide_spice_protocol::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
+use zeroize::Zeroizing;
 
 use crate::ClientError;
 use crate::auth::encrypt_ticket;
@@ -495,7 +496,7 @@ where
             if token_length == 0 || token_length > SASL_MAX_DATA_BYTES {
                 return Err(protocol_value_error("SASL security token length"));
             }
-            let mut token = vec![0; token_length];
+            let mut token = Zeroizing::new(vec![0; token_length]);
             self.stream.read_exact(&mut token).await?;
             self.sasl_decoded = self
                 .sasl_codec

@@ -2,10 +2,10 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
 
-use crate::ipc::{HelperEvent, HelperIpcError, write_event};
+use oxide_spice_helper_protocol::{HelperEvent, HelperIpcError, write_event};
 
 const EVENT_QUEUE_CAPACITY: usize = 64;
 
@@ -20,8 +20,13 @@ pub(crate) struct EventWriter {
 }
 
 struct EventQueue {
-    events: VecDeque<HelperEvent>,
+    events: VecDeque<QueuedEvent>,
     closed: bool,
+}
+
+struct QueuedEvent {
+    event: HelperEvent,
+    written: Option<mpsc::SyncSender<()>>,
 }
 
 impl EventWriter {
@@ -75,15 +80,45 @@ impl EventSender {
                 "helper control event queue is full",
             )));
         }
-        queue.events.push_back(event);
+        queue.events.push_back(QueuedEvent {
+            event,
+            written: None,
+        });
         wake.notify_one();
         Ok(())
+    }
+
+    /// Writes one control event completely before allowing the caller to read more input.
+    pub(crate) fn send_barrier(&self, event: HelperEvent) -> Result<(), HelperIpcError> {
+        let (written, receipt) = mpsc::sync_channel(0);
+        let (queue, wake) = &*self.shared;
+        let mut queue = queue.lock().map_err(|_| poisoned_queue_error())?;
+        if queue.closed {
+            return Err(closed_queue_error());
+        }
+        if queue.events.len() >= EVENT_QUEUE_CAPACITY {
+            return Err(HelperIpcError::Io(std::io::Error::other(
+                "helper control event queue is full",
+            )));
+        }
+        queue.events.push_back(QueuedEvent {
+            event,
+            written: Some(written),
+        });
+        wake.notify_one();
+        drop(queue);
+        receipt.recv().map_err(|_| {
+            HelperIpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "helper event writer closed before the handshake was flushed",
+            ))
+        })
     }
 
     pub(crate) fn has_pending_frame(&self) -> Result<bool, HelperIpcError> {
         let (queue, _) = &*self.shared;
         let queue = queue.lock().map_err(|_| poisoned_queue_error())?;
-        Ok(queue.events.iter().any(is_frame))
+        Ok(queue.events.iter().any(|queued| is_frame(&queued.event)))
     }
 
     pub(crate) fn send_frame(&self, event: HelperEvent) -> Result<(), HelperIpcError> {
@@ -93,15 +128,22 @@ impl EventSender {
         if queue.closed {
             return Err(closed_queue_error());
         }
-        if queue.events.back().is_some_and(is_frame) {
-            *queue.events.back_mut().expect("frame exists") = event;
+        if queue
+            .events
+            .back()
+            .is_some_and(|queued| queued.written.is_none() && is_frame(&queued.event))
+        {
+            queue.events.back_mut().expect("frame exists").event = event;
         } else {
             if queue.events.len() >= EVENT_QUEUE_CAPACITY {
                 return Err(HelperIpcError::Io(std::io::Error::other(
                     "helper event queue is full",
                 )));
             }
-            queue.events.push_back(event);
+            queue.events.push_back(QueuedEvent {
+                event,
+                written: None,
+            });
         }
         wake.notify_one();
         Ok(())
@@ -120,7 +162,7 @@ fn write_stdout_events(shared: Arc<(Mutex<EventQueue>, Condvar)>) -> Result<(), 
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     loop {
-        let event = {
+        let queued = {
             let (queue, wake) = &*shared;
             let mut queue = queue.lock().map_err(|_| poisoned_queue_error())?;
             while queue.events.is_empty() && !queue.closed {
@@ -132,7 +174,12 @@ fn write_stdout_events(shared: Arc<(Mutex<EventQueue>, Condvar)>) -> Result<(), 
                 None => continue,
             }
         };
-        write_event(&mut stdout, &event)?;
+        write_event(&mut stdout, &queued.event)?;
+        use std::io::Write;
+        stdout.flush()?;
+        if let Some(written) = queued.written {
+            let _ = written.send(());
+        }
     }
 }
 

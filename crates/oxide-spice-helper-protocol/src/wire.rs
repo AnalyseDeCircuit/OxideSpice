@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::{HelperHello, HelperHelloAck, HelperMetadata};
+
 const MAX_JSON_LINE_BYTES: usize = 1024 * 1024;
 const MAX_BINARY_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
 
@@ -48,14 +50,8 @@ impl Drop for HelperSecret {
     rename_all_fields = "camelCase"
 )]
 pub enum HelperEndpoint {
-    Tcp {
-        host: String,
-        port: u16,
-    },
-    #[cfg(unix)]
-    Unix {
-        path: PathBuf,
-    },
+    Tcp { host: String, port: u16 },
+    Unix { path: PathBuf },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -121,6 +117,18 @@ pub struct HelperUsbDeviceIdentity {
     pub device_address: u8,
     pub vendor_id: u16,
     pub product_id: u16,
+}
+
+/// Runtime availability of a native device service on the current host.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "state",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum HelperNativeBackendStatus {
+    Available,
+    Unavailable { reason: String },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -243,6 +251,9 @@ pub struct HelperMonitor {
     rename_all_fields = "camelCase"
 )]
 pub enum HelperRequest {
+    Hello {
+        hello: HelperHello,
+    },
     Connect {
         options: HelperConnectOptions,
     },
@@ -345,6 +356,7 @@ pub enum HelperRequest {
 impl fmt::Debug for HelperRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Hello { hello } => formatter.debug_tuple("Hello").field(hello).finish(),
             Self::Connect { options } => formatter
                 .debug_struct("Connect")
                 .field("endpoint", &options.endpoint)
@@ -582,6 +594,9 @@ pub struct HelperGraphicsDevice {
     rename_all_fields = "camelCase"
 )]
 pub enum HelperEvent {
+    HelloAck {
+        acknowledgement: HelperHelloAck,
+    },
     Status {
         status: HelperStatus,
         message: Option<String>,
@@ -706,7 +721,9 @@ pub enum HelperEvent {
     },
     NativeDevices {
         usb_devices: Vec<HelperUsbDeviceIdentity>,
+        usb_status: HelperNativeBackendStatus,
         smartcard_readers: Vec<String>,
+        smartcard_status: HelperNativeBackendStatus,
     },
     AgentState {
         connection_generation: u64,
@@ -765,6 +782,16 @@ enum BinaryRequestHeader {
         channel_id: u8,
         payload_len: usize,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum InitialRequest {
+    Hello { hello: HelperHello },
 }
 
 #[derive(Deserialize, Serialize)]
@@ -832,6 +859,8 @@ pub enum HelperIpcError {
     LineTooLarge,
     #[error("helper IPC line is not UTF-8")]
     InvalidUtf8,
+    #[error("the first helper IPC request must be Hello")]
+    ExpectedHello,
     #[error("helper IPC binary payload exceeds {MAX_BINARY_PAYLOAD_BYTES} bytes")]
     BinaryPayloadTooLarge,
     #[error("helper IPC binary payload does not match its metadata")]
@@ -840,6 +869,20 @@ pub enum HelperIpcError {
     FileTransferChunkTooLarge,
     #[error("Port payload exceeds the SPICE payload bound")]
     PortPayloadTooLarge,
+}
+
+/// Reads only the credential-free Hello shape used before the version gate opens.
+pub fn read_initial_hello(
+    reader: &mut impl BufRead,
+) -> Result<Option<HelperHello>, HelperIpcError> {
+    let Some(line) = read_bounded_line(reader)? else {
+        return Ok(None);
+    };
+    let request =
+        serde_json::from_str::<InitialRequest>(&line).map_err(|_| HelperIpcError::ExpectedHello)?;
+    Ok(Some(match request {
+        InitialRequest::Hello { hello } => hello,
+    }))
 }
 
 pub fn read_request(reader: &mut impl BufRead) -> Result<Option<HelperRequest>, HelperIpcError> {
@@ -1193,6 +1236,22 @@ pub fn read_event(reader: &mut impl BufRead) -> Result<Option<HelperEvent>, Help
             }
         }
     }))
+}
+
+/// Writes one newline-terminated helper metadata document.
+pub fn write_metadata(
+    writer: &mut impl Write,
+    metadata: &HelperMetadata,
+) -> Result<(), HelperIpcError> {
+    write_json_line(writer, metadata)
+}
+
+/// Reads one bounded helper metadata document.
+pub fn read_metadata(reader: &mut impl BufRead) -> Result<Option<HelperMetadata>, HelperIpcError> {
+    let Some(line) = read_bounded_line(reader)? else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::from_str(&line)?))
 }
 
 fn read_bounded_line(

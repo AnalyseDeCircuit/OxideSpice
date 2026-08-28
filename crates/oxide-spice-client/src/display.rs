@@ -18,14 +18,16 @@ use oxide_spice_protocol::{
     BitmapFormat, BitmapPalette, CompositeClip, CompositeImage, CompressedImageUpdate, CopyBits,
     DisplayBrush, DisplayInit, DisplayMask, DrawAlphaBlend, DrawCopy as ClassicDrawCopy,
     DrawCopyImageType, DrawFill as ClassicDrawFill, DrawMaskedDestination, DrawOpaque, DrawRop3,
-    DrawStroke, DrawText, DrawTransparent, EmbeddedImage, GlDraw, GlScanout2Unix, GlScanoutUnix,
-    ImageCompression, InvalidateList, MonitorHead, MonitorsConfig, Rect, StreamClip,
-    StreamClipUpdate, StreamCreate, StreamData, StreamReport, StreamReportActivation,
-    SurfaceCreate, SurfaceFormat, VideoCodec, WaitForChannels, common_server, display_capability,
-    display_client, display_server, encode_preferred_video_codecs,
+    DrawStroke, DrawText, DrawTransparent, EmbeddedImage, ImageCompression, InvalidateList,
+    MonitorHead, MonitorsConfig, Rect, StreamClip, StreamClipUpdate, StreamCreate, StreamData,
+    StreamReport, StreamReportActivation, SurfaceCreate, SurfaceFormat, VideoCodec,
+    WaitForChannels, common_server, display_capability, display_client, display_server,
+    encode_preferred_video_codecs,
 };
 #[cfg(feature = "composite-pixman")]
 use oxide_spice_protocol::{CompositeTransform, DrawComposite};
+#[cfg(unix)]
+use oxide_spice_protocol::{GlDraw, GlScanout2Unix, GlScanoutUnix};
 #[cfg(feature = "composite-pixman")]
 use pixman::{
     Box32 as PixmanBox32, Filter as PixmanFilter, Fixed as PixmanFixed, FormatCode as PixmanFormat,

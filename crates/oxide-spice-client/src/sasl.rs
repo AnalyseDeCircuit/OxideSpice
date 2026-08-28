@@ -1,10 +1,9 @@
 //! SPICE SASL negotiation and optional post-authentication security framing.
 
+#[cfg(feature = "sasl-gssapi")]
+mod gssapi;
+
 use rsasl::callback::{Context, Request, SessionCallback, SessionData};
-#[cfg(feature = "sasl-gssapi")]
-use rsasl::mechanisms::gssapi::GSSAPI;
-#[cfg(feature = "sasl-gssapi")]
-use rsasl::mechanisms::gssapi::properties::{GssSecurityLayer, GssService, SecurityLayer};
 use rsasl::mechanisms::login::LOGIN;
 use rsasl::mechanisms::plain::PLAIN;
 use rsasl::mechanisms::scram::{SCRAM_SHA1, SCRAM_SHA256, SCRAM_SHA512};
@@ -13,7 +12,7 @@ use rsasl::prelude::{
 };
 use rsasl::property::{AuthId, AuthzId, Hostname, Password};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::ClientError;
 
@@ -21,6 +20,8 @@ pub(crate) const SASL_MAX_DATA_BYTES: usize = 1024 * 1024;
 pub(crate) const SASL_SECURITY_PLAINTEXT_BYTES: usize = 8192;
 
 /// Password credentials for SASL mechanisms that do not use the system Kerberos cache.
+// Cloning is limited to bounded channel authentication and the Session-owned migration manager;
+// every password copy remains zeroizing and is dropped with those owners.
 #[derive(Clone)]
 pub struct SaslCredentials {
     authentication_id: String,
@@ -131,13 +132,9 @@ pub(crate) struct SaslParameters<'a> {
 
 struct SaslCallback {
     hostname: String,
-    #[cfg(feature = "sasl-gssapi")]
-    service: String,
     authentication_id: Option<String>,
     authorization_id: Option<String>,
     password: Option<Zeroizing<String>>,
-    #[cfg(feature = "sasl-gssapi")]
-    security_layers: SecurityLayer,
 }
 
 impl SessionCallback for SaslCallback {
@@ -157,43 +154,51 @@ impl SessionCallback for SaslCallback {
             request.satisfy::<Password>(password.as_bytes())?;
         }
         request.satisfy::<Hostname>(&self.hostname)?;
-        #[cfg(feature = "sasl-gssapi")]
-        request
-            .satisfy::<GssService>(&self.service)?
-            .satisfy::<GssSecurityLayer>(&self.security_layers)?;
         Ok(())
     }
 }
 
 /// Completed SASL mechanism retained only when it negotiated a security layer.
-pub(crate) struct SaslCodec {
-    session: Session,
+pub(crate) enum SaslCodec {
+    Rsasl(Session),
+    #[cfg(feature = "sasl-gssapi")]
+    Gssapi(gssapi::GssapiCodec),
 }
 
 impl SaslCodec {
-    pub(crate) fn encode(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, ClientError> {
-        let mut token = Vec::new();
-        let consumed = self
-            .session
-            .encode(plaintext, &mut token)
-            .map_err(|error| ClientError::Sasl(error.to_string()))?;
-        if consumed != plaintext.len() || token.is_empty() || token.len() > SASL_MAX_DATA_BYTES {
+    pub(crate) fn encode(&mut self, plaintext: &[u8]) -> Result<Zeroizing<Vec<u8>>, ClientError> {
+        let token = match self {
+            Self::Rsasl(session) => {
+                let mut token = Zeroizing::new(Vec::new());
+                let consumed = session
+                    .encode(plaintext, &mut *token)
+                    .map_err(|error| ClientError::Sasl(error.to_string()))?;
+                if consumed != plaintext.len() {
+                    return Err(ClientError::Sasl(
+                        "SASL security layer did not consume the complete input".to_owned(),
+                    ));
+                }
+                token
+            }
+            #[cfg(feature = "sasl-gssapi")]
+            Self::Gssapi(codec) => codec.encode(plaintext)?,
+        };
+        if token.is_empty() || token.len() > SASL_MAX_DATA_BYTES {
             return Err(ClientError::Sasl(
                 "invalid SASL security-layer output length".to_owned(),
             ));
         }
-        let token_length = u32::try_from(token.len())
-            .map_err(|_| ClientError::Sasl("SASL token length overflow".to_owned()))?;
-        let mut framed = Vec::with_capacity(4 + token.len());
-        framed.extend_from_slice(&token_length.to_be_bytes());
-        framed.extend_from_slice(&token);
-        Ok(framed)
+        frame_security_token(token)
     }
 
     pub(crate) fn decode(&mut self, token: &[u8]) -> Result<Vec<u8>, ClientError> {
+        let session = match self {
+            Self::Rsasl(session) => session,
+            #[cfg(feature = "sasl-gssapi")]
+            Self::Gssapi(codec) => return codec.decode(token),
+        };
         let mut plaintext = Vec::new();
-        let consumed = self
-            .session
+        let consumed = session
             .decode(token, &mut plaintext)
             .map_err(|error| ClientError::Sasl(error.to_string()))?;
         if consumed != token.len() || plaintext.is_empty() {
@@ -205,6 +210,16 @@ impl SaslCodec {
     }
 }
 
+fn frame_security_token(mut token: Zeroizing<Vec<u8>>) -> Result<Zeroizing<Vec<u8>>, ClientError> {
+    let token_length = u32::try_from(token.len())
+        .map_err(|_| ClientError::Sasl("SASL token length overflow".to_owned()))?;
+    let mut framed = Zeroizing::new(Vec::with_capacity(4 + token.len()));
+    framed.extend_from_slice(&token_length.to_be_bytes());
+    framed.extend_from_slice(&token);
+    token.zeroize();
+    Ok(framed)
+}
+
 pub(crate) async fn authenticate_sasl<S>(
     stream: &mut S,
     parameters: SaslParameters<'_>,
@@ -214,19 +229,15 @@ where
 {
     let mechanism_list = read_bounded_bytes(stream, "SASL mechanism list").await?;
     let mechanism_names = parse_mechanism_list(&mechanism_list)?;
+    #[cfg(feature = "sasl-gssapi")]
+    if parameters.options.allow_gssapi && mechanism_names.contains(&"GSSAPI") {
+        return gssapi::authenticate(stream, parameters)
+            .await
+            .map(|codec| codec.map(SaslCodec::Gssapi));
+    }
     let callback = sasl_callback(parameters);
     static PASSWORD_MECHANISMS: &[Mechanism] =
         &[SCRAM_SHA512, SCRAM_SHA256, SCRAM_SHA1, PLAIN, LOGIN];
-    #[cfg(feature = "sasl-gssapi")]
-    static GSSAPI_MECHANISMS: &[Mechanism] =
-        &[GSSAPI, SCRAM_SHA512, SCRAM_SHA256, SCRAM_SHA1, PLAIN, LOGIN];
-    #[cfg(feature = "sasl-gssapi")]
-    let registry = if parameters.options.allow_gssapi {
-        Registry::with_mechanisms(GSSAPI_MECHANISMS)
-    } else {
-        Registry::with_mechanisms(PASSWORD_MECHANISMS)
-    };
-    #[cfg(not(feature = "sasl-gssapi"))]
     let registry = Registry::with_mechanisms(PASSWORD_MECHANISMS);
     let config = SASLConfig::builder()
         .with_registry(registry)
@@ -315,24 +326,16 @@ where
     }
     Ok(session
         .has_security_layer()
-        .then_some(SaslCodec { session }))
+        .then_some(SaslCodec::Rsasl(session)))
 }
 
 fn sasl_callback(parameters: SaslParameters<'_>) -> SaslCallback {
     let credentials = parameters.options.credentials.as_ref();
     SaslCallback {
         hostname: parameters.options.hostname.clone(),
-        #[cfg(feature = "sasl-gssapi")]
-        service: parameters.options.service.clone(),
         authentication_id: credentials.map(|value| value.authentication_id.clone()),
         authorization_id: credentials.and_then(|value| value.authorization_id.clone()),
         password: credentials.map(|value| value.password.clone()),
-        #[cfg(feature = "sasl-gssapi")]
-        security_layers: if parameters.require_security_layer {
-            SecurityLayer::INTEGRITY | SecurityLayer::CONFIDENTIALITY
-        } else {
-            SecurityLayer::all()
-        },
     }
 }
 
@@ -375,7 +378,7 @@ where
 async fn read_bounded_bytes<S>(
     stream: &mut S,
     context: &'static str,
-) -> Result<Vec<u8>, ClientError>
+) -> Result<Zeroizing<Vec<u8>>, ClientError>
 where
     S: AsyncRead + Unpin,
 {
@@ -384,7 +387,7 @@ where
     if length > SASL_MAX_DATA_BYTES {
         return Err(ClientError::Sasl(format!("{context} exceeds local bound")));
     }
-    let mut output = vec![0; length];
+    let mut output = Zeroizing::new(vec![0; length]);
     stream.read_exact(&mut output).await?;
     Ok(output)
 }
@@ -434,6 +437,12 @@ mod tests {
         );
         assert!(parse_mechanism_list(b"GSSAPI").is_err());
         assert!(parse_mechanism_list(b",,").is_err());
+    }
+
+    #[test]
+    fn security_layer_token_has_a_big_endian_length_prefix() {
+        let framed = frame_security_token(Zeroizing::new(vec![0xaa, 0xbb])).expect("frame token");
+        assert_eq!(&*framed, &[0, 0, 0, 2, 0xaa, 0xbb]);
     }
 
     #[tokio::test]

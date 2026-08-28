@@ -1,0 +1,16 @@
+[package]
+name = "oxide-spice-helper-protocol"
+description = "Versioned bounded IPC protocol shared by the OxideSpice helper and host applications"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+oxide-spice-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

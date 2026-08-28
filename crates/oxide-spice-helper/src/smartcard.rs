@@ -58,6 +58,14 @@ pub fn list_pcsc_readers() -> Result<Vec<PcscReader>, SmartcardRedirectionError>
         .collect())
 }
 
+/// Confirms that the PC/SC client library can enter its system-service boundary.
+pub fn check_pcsc_client_library() -> Result<(), SmartcardRedirectionError> {
+    match Context::establish(Scope::User) {
+        Ok(_) | Err(pcsc::Error::NoService | pcsc::Error::ServiceStopped) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Redirects one already-selected PC/SC reader until the SPICE channel closes.
 pub async fn run_smartcard_redirection(
     mut channel: SmartcardChannel,

@@ -538,6 +538,8 @@ pub enum ConnectionEndpoint {
 }
 
 /// Inputs for one SPICE session attempt.
+// Cloning is required to authenticate independently owned channels and one pending migration.
+// Copies are bounded by validated channel maxima and remain owned by Session/MigrationManager.
 #[derive(Debug, Clone)]
 pub struct ConnectOptions {
     pub endpoint: ConnectionEndpoint,

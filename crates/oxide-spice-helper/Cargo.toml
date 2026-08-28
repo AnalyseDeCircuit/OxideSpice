@@ -34,14 +34,12 @@ dav-server = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 oxide-spice-client = { path = "../oxide-spice-client", default-features = false }
+oxide-spice-helper-protocol.workspace = true
 oxide-spice-protocol = { path = "../oxide-spice-protocol" }
 pcsc = { workspace = true, optional = true }
-serde.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 usbredirhost = { workspace = true, optional = true }
-zeroize.workspace = true
 
 [lints]
 workspace = true

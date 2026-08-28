@@ -3,6 +3,7 @@ members = [
     "crates/oxide-spice-client",
     "crates/oxide-spice-codecs",
     "crates/oxide-spice-helper",
+    "crates/oxide-spice-helper-protocol",
     "crates/oxide-spice-protocol",
 ]
 resolver = "3"
@@ -14,30 +15,32 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 bytemuck = "1.24.0"
+cross-krb5 = { version = "=0.5.0", default-features = false }
 dav-server = { version = "0.11.0", default-features = false, features = ["localfs"] }
 hyper = { version = "1.11.0", default-features = false, features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"] }
 miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
 lz4_flex = { version = "0.14.0", default-features = false, features = ["std", "safe-decode", "safe-encode"] }
 jpeg-decoder = { version = "0.3.2", default-features = false }
-openh264 = "0.9.8"
-opus = "0.4.0"
-pcsc = "2.9.0"
-pixman = "0.2.1"
+openh264 = "=0.9.8"
+opus = "=0.4.0"
+pcsc = "=2.9.0"
+pixman = "=0.2.1"
 oxide-spice-codecs = { path = "crates/oxide-spice-codecs", default-features = false }
+oxide-spice-helper-protocol = { path = "crates/oxide-spice-helper-protocol" }
 oxide-spice-protocol = { path = "crates/oxide-spice-protocol" }
 rsa = { version = "0.9.10", default-features = false, features = ["std", "u64_digit"] }
 sha1 = "0.10.6"
 thiserror = "2.0.20"
-rust_h265 = "0.1.0"
+rust_h265 = "=0.1.0"
 rustix = { version = "1.1.4", default-features = false, features = ["std", "fs", "net"] }
-rsasl = { version = "2.3.1", default-features = false, features = ["config_builder", "login", "plain", "provider", "scram-sha-1", "scram-sha-2"] }
+rsasl = { version = "=2.3.1", default-features = false, features = ["config_builder", "login", "plain", "provider", "scram-sha-1", "scram-sha-2"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.47.1", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
-usbredirhost = "0.4.1"
-vpx-rs = "0.2.1"
+usbredirhost = "=0.4.1"
+vpx-rs = "=0.2.1"
 zeroize = "1.8.1"
 # This release supplies cooperative cancellation for the baseline fast path.
 zune-jpeg = { version = "=0.5.16-rc1", default-features = false, features = ["std"] }

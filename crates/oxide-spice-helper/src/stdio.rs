@@ -4,9 +4,13 @@ use std::io::{self, BufReader};
 
 use tokio::sync::mpsc;
 
+use crate::build_info::helper_build_info;
 use crate::event_writer::EventWriter;
-use crate::ipc::{HelperErrorCategory, HelperEvent, HelperIpcError, HelperRequest, read_request};
 use crate::runtime::{HelperRuntimeError, run_helper};
+use oxide_spice_helper_protocol::{
+    HelperErrorCategory, HelperEvent, HelperIpcError, HelperRequest, ServerHandshake,
+    read_initial_hello, read_request,
+};
 
 const REQUEST_QUEUE_CAPACITY: usize = 128;
 
@@ -39,7 +43,31 @@ fn read_stdin_requests(
     events: crate::event_writer::EventSender,
 ) {
     let stdin = io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
+    // A one-byte pre-handshake buffer prevents read-ahead into a pipelined Connect body.
+    let mut hello_reader = BufReader::with_capacity(1, stdin.lock());
+    let hello = match read_initial_hello(&mut hello_reader) {
+        Ok(Some(hello)) => hello,
+        Ok(None) => return,
+        Err(error) => {
+            let _ = events.send_control(HelperEvent::Error {
+                category: HelperErrorCategory::Protocol,
+                message: error.to_string(),
+            });
+            return;
+        }
+    };
+    let acknowledgement = ServerHandshake::new(helper_build_info()).negotiate(hello);
+    let compatible = acknowledgement.compatible;
+    if events
+        .send_barrier(HelperEvent::HelloAck { acknowledgement })
+        .is_err()
+    {
+        return;
+    }
+    if !compatible {
+        return;
+    }
+    let mut reader = BufReader::new(hello_reader.into_inner());
     loop {
         let request = match read_request(&mut reader) {
             Ok(Some(request)) => request,

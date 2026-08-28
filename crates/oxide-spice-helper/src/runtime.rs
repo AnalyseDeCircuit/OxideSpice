@@ -20,21 +20,21 @@ use oxide_spice_client::{
 };
 #[cfg(feature = "tls-ring")]
 use oxide_spice_client::{MigrationTlsConfiguration, MigrationTlsPolicy};
+use oxide_spice_helper_protocol::{
+    HelperAgentFeatures, HelperAgentStateKind, HelperAudioDataMode, HelperButtonState,
+    HelperChannelCapabilities, HelperClipboardFormat, HelperClipboardSelection,
+    HelperConnectOptions, HelperEndpoint, HelperErrorCategory, HelperEvent,
+    HelperFileTransferFailure, HelperFileTransferState, HelperGraphicsDevice, HelperIpcError,
+    HelperKeyState, HelperMonitor, HelperMouseButton, HelperMouseMode, HelperNativeBackendStatus,
+    HelperPixelFormat, HelperPlaybackStateKind, HelperPortStateKind, HelperRecordStateKind,
+    HelperRect, HelperRequest, HelperSasl, HelperStatus, HelperTopologyMonitor,
+    HelperTransportSecurity, HelperUsbDeviceIdentity,
+};
 use oxide_spice_protocol::{AgentClipboardType, ChannelType, Rect};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use crate::event_writer::EventSender;
-use crate::ipc::{
-    HelperAgentFeatures, HelperAgentStateKind, HelperAudioDataMode, HelperButtonState,
-    HelperChannelCapabilities, HelperClipboardFormat, HelperClipboardSelection,
-    HelperConnectOptions, HelperEndpoint, HelperErrorCategory, HelperEvent,
-    HelperFileTransferFailure, HelperFileTransferState, HelperGraphicsDevice, HelperIpcError,
-    HelperKeyState, HelperMonitor, HelperMouseButton, HelperMouseMode, HelperPixelFormat,
-    HelperPlaybackStateKind, HelperPortStateKind, HelperRecordStateKind, HelperRect, HelperRequest,
-    HelperSasl, HelperStatus, HelperTopologyMonitor, HelperTransportSecurity,
-    HelperUsbDeviceIdentity,
-};
 #[cfg(feature = "smartcard")]
 use crate::smartcard::{list_pcsc_readers, run_smartcard_redirection};
 #[cfg(feature = "usbredir")]
@@ -143,12 +143,17 @@ pub(crate) async fn run_helper(
     let Some(first_request) = requests.recv().await else {
         return Ok(());
     };
-    let HelperRequest::Connect { options } = first_request else {
-        events.send_control(HelperEvent::Error {
-            category: HelperErrorCategory::Configuration,
-            message: "the first helper request must be Connect".to_owned(),
-        })?;
-        return Ok(());
+    let options = match first_request {
+        HelperRequest::Connect { options } => options,
+        HelperRequest::Close => return Ok(()),
+        _ => {
+            events.send_control(HelperEvent::Error {
+                category: HelperErrorCategory::Configuration,
+                message: "the first post-handshake helper request must be Connect or Close"
+                    .to_owned(),
+            })?;
+            return Ok(());
+        }
     };
 
     events.send_control(HelperEvent::Status {
@@ -178,6 +183,16 @@ pub(crate) async fn run_helper(
         }
     };
     let mut resources = take_session_resources(session);
+    let drive_result = drive_session(&mut resources, &mut requests, &events).await;
+    let shutdown_result = shutdown_session(resources, &events).await;
+    drive_result.and(shutdown_result)
+}
+
+async fn drive_session(
+    resources: &mut SessionResources,
+    requests: &mut mpsc::Receiver<HelperRequest>,
+    events: &EventSender,
+) -> Result<(), HelperRuntimeError> {
     let capabilities = session_capabilities(&resources);
     let server_identity = resources.session.server_identity();
     events.send_control(HelperEvent::Connected {
@@ -199,7 +214,7 @@ pub(crate) async fn run_helper(
     publish_agent_state(resources.agent.state(), &events)?;
     publish_agent_audio_volume(resources.agent.audio_volume(), &events)?;
     publish_agent_graphics_devices(resources.agent.graphics_devices(), &events)?;
-    start_generic_port_bridges(&mut resources, events.clone());
+    start_generic_port_bridges(resources, events.clone());
 
     let mut record_poll = tokio::time::interval(RECORD_STATE_POLL_INTERVAL);
     loop {
@@ -208,7 +223,7 @@ pub(crate) async fn run_helper(
                 let Some(request) = request else {
                     break;
                 };
-                if handle_request(request, &mut resources, &events).await? {
+                if handle_request(request, resources, events).await? {
                     break;
                 }
             }
@@ -216,7 +231,7 @@ pub(crate) async fn run_helper(
                 if let Some(mouse_mode) = mouse_mode {
                     publish_mouse_mode(
                         mouse_mode.map_err(|error| HelperRuntimeError::HostApi(error.to_string()))?,
-                        &events,
+                        events,
                     )?;
                 }
             }
@@ -224,16 +239,16 @@ pub(crate) async fn run_helper(
                 if let Some(modifiers) = modifiers {
                     publish_keyboard_modifiers(
                         modifiers.map_err(|error| HelperRuntimeError::HostApi(error.to_string()))?,
-                        &events,
+                        events,
                     )?;
                 }
             }
             frame = resources.session.next_frame() => {
                 match frame {
-                    Ok(frame) => publish_frame(frame, &events).await?,
+                    Ok(frame) => publish_frame(frame, events).await?,
                     Err(error) => {
                         if error.category() != ErrorCategory::Cancelled {
-                            send_client_error(&events, &error)?;
+                            send_client_error(events, &error)?;
                         }
                         break;
                     }
@@ -241,42 +256,42 @@ pub(crate) async fn run_helper(
             }
             cursor = next_cursor(&mut resources.cursor_events) => {
                 if let Some(cursor) = cursor {
-                    publish_cursor(cursor?, &mut resources.last_cursor_shape, &events)?;
+                    publish_cursor(cursor?, &mut resources.last_cursor_shape, events)?;
                 }
             }
             topology = resources.topology_events.next() => {
-                publish_topology(topology?, &events)?;
+                publish_topology(topology?, events)?;
             }
             agent_event = next_agent_event(&mut resources.agent_events) => {
                 if let Some(agent_event) = agent_event {
                     publish_agent_event(
                         agent_event.map_err(|error| HelperRuntimeError::HostApi(error.to_string()))?,
                         &mut resources.pending_clipboard_requests,
-                        &events,
+                        events,
                     )?;
                 }
             }
             offers = resources.agent_offer_events.clipboard_offers_changed() => {
                 publish_clipboard_offers(
                     offers.map_err(|error| HelperRuntimeError::HostApi(error.to_string()))?,
-                    &events,
+                    events,
                 )?;
             }
             agent_state = resources.agent_state_events.changed() => {
                 let agent_state = agent_state
                     .map_err(|error| HelperRuntimeError::HostApi(error.to_string()))?;
-                publish_agent_state(agent_state, &events)?;
+                publish_agent_state(agent_state, events)?;
             }
             volume = resources.agent_audio_events.audio_volume_changed() => {
                 publish_agent_audio_volume(
                     volume.map_err(|error| HelperRuntimeError::HostApi(error.to_string()))?,
-                    &events,
+                    events,
                 )?;
             }
             devices = resources.agent_graphics_events.graphics_devices_changed() => {
                 publish_agent_graphics_devices(
                     devices.map_err(|error| HelperRuntimeError::HostApi(error.to_string()))?,
-                    &events,
+                    events,
                 )?;
             }
             playback = next_playback(&mut resources.playback_packets) => {
@@ -295,12 +310,12 @@ pub(crate) async fn run_helper(
                 }
             }
             _ = record_poll.tick(), if !resources.record_channels.is_empty() || !resources.session.playback_channels().is_empty() => {
-                publish_playback_state_changes(&mut resources, &events)?;
-                publish_record_state_changes(&mut resources, &events)?;
+                publish_playback_state_changes(resources, events)?;
+                publish_record_state_changes(resources, events)?;
             }
             integration = resources.integration_tasks.join_next(), if !resources.integration_tasks.is_empty() => {
                 if let Some(integration) = integration {
-                    publish_integration_completion(integration, &events)?;
+                    publish_integration_completion(integration, events)?;
                 }
             }
             transfer = resources.file_transfer_tasks.join_next(), if !resources.file_transfer_tasks.is_empty() => {
@@ -317,10 +332,20 @@ pub(crate) async fn run_helper(
         }
     }
 
-    events.send_control(HelperEvent::Status {
-        status: HelperStatus::Closing,
-        message: None,
-    })?;
+    Ok(())
+}
+
+async fn shutdown_session(
+    mut resources: SessionResources,
+    events: &EventSender,
+) -> Result<(), HelperRuntimeError> {
+    let mut first_error = events
+        .send_control(HelperEvent::Status {
+            status: HelperStatus::Closing,
+            message: None,
+        })
+        .err()
+        .map(HelperRuntimeError::Ipc);
     resources.integration_tasks.abort_all();
     while resources.integration_tasks.join_next().await.is_some() {}
     resources.file_transfer_senders.clear();
@@ -331,17 +356,25 @@ pub(crate) async fn run_helper(
     while resources.port_tasks.join_next().await.is_some() {}
     resources.background_tasks.abort_all();
     while resources.background_tasks.join_next().await.is_some() {}
-    let shutdown = resources.session.shutdown().await;
-    if let Err(error) = shutdown
+    if let Err(error) = resources.session.shutdown().await
         && error.category() != ErrorCategory::Cancelled
     {
-        send_client_error(&events, &error)?;
+        let _ = send_client_error(events, &error);
+        if first_error.is_none() {
+            first_error = Some(HelperRuntimeError::Client(error));
+        }
     }
-    events.send_control(HelperEvent::Status {
+    if let Err(error) = events.send_control(HelperEvent::Status {
         status: HelperStatus::Disconnected,
         message: None,
-    })?;
-    Ok(())
+    }) && first_error.is_none()
+    {
+        first_error = Some(HelperRuntimeError::Ipc(error));
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 fn build_connect_options(
@@ -360,6 +393,12 @@ fn build_connect_options(
         #[cfg(unix)]
         HelperEndpoint::Unix { path } => {
             ConnectOptions::new_unix(path, TicketSecret::new(ticket.into_inner()))
+        }
+        #[cfg(not(unix))]
+        HelperEndpoint::Unix { .. } => {
+            return Err(HelperRuntimeError::Configuration(
+                "Unix endpoints are unavailable on this helper target".to_owned(),
+            ));
         }
     };
     connect_options.enable_gl_scanout = false;
@@ -850,8 +889,11 @@ async fn handle_request(
     events: &EventSender,
 ) -> Result<bool, HelperRuntimeError> {
     let result = match request {
+        HelperRequest::Hello { .. } => {
+            Err("Hello is only valid as the first IPC request".to_owned())
+        }
+        HelperRequest::Connect { .. } => Err("the helper already owns a SPICE session".to_owned()),
         HelperRequest::Close => return Ok(true),
-        HelperRequest::Connect { .. } => Err("session is already connected".to_owned()),
         HelperRequest::PointerPosition {
             x,
             y,
@@ -1291,12 +1333,16 @@ fn start_native_device_discovery(
     ensure_integration_task_capacity(resources)?;
     resources.integration_tasks.spawn(async move {
         let result = async {
-            let (usb_devices, smartcard_readers) =
+            let (usb_result, smartcard_result) =
                 tokio::join!(discover_usb_devices(), discover_smartcard_readers());
+            let (usb_devices, usb_status) = native_inventory(usb_result);
+            let (smartcard_readers, smartcard_status) = native_inventory(smartcard_result);
             events
                 .send_control(HelperEvent::NativeDevices {
-                    usb_devices: usb_devices?,
-                    smartcard_readers: smartcard_readers?,
+                    usb_devices,
+                    usb_status,
+                    smartcard_readers,
+                    smartcard_status,
                 })
                 .map_err(|error| error.to_string())
         }
@@ -1307,6 +1353,33 @@ fn start_native_device_discovery(
         }
     });
     Ok(())
+}
+
+fn native_inventory<T>(result: Result<Vec<T>, String>) -> (Vec<T>, HelperNativeBackendStatus) {
+    match result {
+        Ok(devices) => (devices, HelperNativeBackendStatus::Available),
+        Err(reason) => (
+            Vec::new(),
+            HelperNativeBackendStatus::Unavailable { reason },
+        ),
+    }
+}
+
+#[cfg(test)]
+mod native_inventory_tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_service_keeps_a_typed_reason() {
+        let (devices, status) = native_inventory::<u8>(Err("service unavailable".to_owned()));
+        assert!(devices.is_empty());
+        assert_eq!(
+            status,
+            HelperNativeBackendStatus::Unavailable {
+                reason: "service unavailable".to_owned(),
+            }
+        );
+    }
 }
 
 #[cfg(feature = "usbredir")]
