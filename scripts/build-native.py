@@ -184,6 +184,11 @@ def build_libvpx(source: Path, build: Path, prefix: Path, platform: str, archite
     if platform == "windows":
         # The generated solution exposes both configurations, but packaging only needs Release.
         visual_studio_platform = "x64" if architecture == "x86_64" else "ARM64"
+        run(
+            [make_executable, "vpx.sln.mk"],
+            cwd=build,
+            environment=libvpx_environment,
+        )
         make_arguments.append(f"Release_{visual_studio_platform}")
     run(make_arguments, cwd=build, environment=libvpx_environment)
     run([make_executable, "install"], cwd=build, environment=libvpx_environment)
