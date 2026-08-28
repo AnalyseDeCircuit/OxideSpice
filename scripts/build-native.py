@@ -191,12 +191,12 @@ def build_libvpx(source: Path, build: Path, prefix: Path, platform: str, archite
     if platform == "windows":
         # Git Bash keeps upstream shell recipes away from the Windows WSL association.
         run(
-            [str(git_bash_path), "-c", f"SHELL=/bin/bash make -j{make_jobs}"],
+            [str(git_bash_path), "-c", f"make SHELL=/bin/bash -j{make_jobs}"],
             cwd=build,
             environment=libvpx_environment,
         )
         run(
-            [str(git_bash_path), "-c", "SHELL=/bin/bash make install"],
+            [str(git_bash_path), "-c", "make SHELL=/bin/bash install"],
             cwd=build,
             environment=libvpx_environment,
         )
