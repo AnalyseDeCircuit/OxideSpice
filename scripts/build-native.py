@@ -81,17 +81,6 @@ def copy_license(source: Path, prefix: Path, package: str, candidates: tuple[str
     raise FileNotFoundError(f"license file not found for {package}")
 
 
-def git_bash() -> str:
-    """Resolve Git for Windows Bash without selecting the WSL launcher."""
-    git_executable = shutil.which("git")
-    if git_executable is None:
-        raise FileNotFoundError("git.exe is required to locate Git Bash")
-    candidate = Path(git_executable).parent.parent / "bin" / "bash.exe"
-    if not candidate.is_file():
-        raise FileNotFoundError(f"Git Bash was not found at {candidate}")
-    return str(candidate)
-
-
 def build_libusb(
     source: Path,
     version: str,
@@ -157,6 +146,7 @@ def build_libusb(
 def build_libvpx(source: Path, build: Path, prefix: Path, platform: str, architecture: str, environment: dict[str, str]) -> None:
     build.mkdir(parents=True, exist_ok=True)
     libvpx_environment = environment.copy()
+    make_executable = "make"
     command = [
         str(source / "configure"),
         f"--prefix={prefix}",
@@ -173,38 +163,25 @@ def build_libvpx(source: Path, build: Path, prefix: Path, platform: str, archite
     elif platform == "macos":
         command.append(f"--target={target_architecture}-darwin24-gcc")
     else:
-        # Relative source paths remain valid in both Git Bash and native Windows make.
-        git_bash_path = Path(git_bash())
-        libvpx_environment["PATH"] = os.pathsep.join(
-            (str(git_bash_path.parent), libvpx_environment["PATH"])
-        )
+        # Keep libvpx's shell scripts and Make recipes inside one MSYS2 environment.
+        if libvpx_environment.get("MSYSTEM") != "MSYS":
+            raise RuntimeError("Windows libvpx builds require the MSYS2 MSYS environment")
+        bash_executable = shutil.which("bash")
+        make_executable = shutil.which("make")
+        if bash_executable is None or make_executable is None:
+            raise FileNotFoundError("MSYS2 Bash and Make are required for Windows libvpx builds")
         command[0] = Path(os.path.relpath(source / "configure", build)).as_posix()
         command[1] = f"--prefix={prefix.resolve().as_posix()}"
         command = [
-            str(git_bash_path),
+            bash_executable,
             *command,
             f"--target={target_architecture}-win64-vs17",
             "--enable-static-msvcrt",
         ]
     run(command, cwd=build, environment=libvpx_environment)
     make_jobs = os.cpu_count() or 2
-    if platform == "windows":
-        # Windows GNU Make must receive an absolute shell path or it selects WSL.
-        make_shell = git_bash_path.as_posix()
-        make_shell_arguments = (f"SHELL={make_shell}", f"MAKESHELL={make_shell}")
-        run(
-            ["make", *make_shell_arguments, f"-j{make_jobs}"],
-            cwd=build,
-            environment=libvpx_environment,
-        )
-        run(
-            ["make", *make_shell_arguments, "install"],
-            cwd=build,
-            environment=libvpx_environment,
-        )
-    else:
-        run(["make", f"-j{make_jobs}"], cwd=build, environment=libvpx_environment)
-        run(["make", "install"], cwd=build, environment=libvpx_environment)
+    run([make_executable, f"-j{make_jobs}"], cwd=build, environment=libvpx_environment)
+    run([make_executable, "install"], cwd=build, environment=libvpx_environment)
     if platform == "windows":
         installed_library = prefix / "lib" / "vpx.lib"
         if installed_library.is_file():
