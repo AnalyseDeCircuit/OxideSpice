@@ -170,12 +170,13 @@ def build_libvpx(source: Path, build: Path, prefix: Path, platform: str, archite
         make_executable = shutil.which("make")
         if bash_executable is None or make_executable is None:
             raise FileNotFoundError("MSYS2 Bash and Make are required for Windows libvpx builds")
+        visual_studio_toolchain = f"{target_architecture}-win64-vs17"
         command[0] = Path(os.path.relpath(source / "configure", build)).as_posix()
         command[1] = f"--prefix={prefix.resolve().as_posix()}"
         command = [
             bash_executable,
             *command,
-            f"--target={target_architecture}-win64-vs17",
+            f"--target={visual_studio_toolchain}",
             "--enable-static-msvcrt",
         ]
     run(command, cwd=build, environment=libvpx_environment)
@@ -184,11 +185,13 @@ def build_libvpx(source: Path, build: Path, prefix: Path, platform: str, archite
     if platform == "windows":
         # The generated solution exposes both configurations, but packaging only needs Release.
         visual_studio_platform = "x64" if architecture == "x86_64" else "ARM64"
+        solution_make_target = f"target=solution-{visual_studio_toolchain}"
         run(
-            [make_executable, "vpx.sln.mk"],
+            [make_executable, solution_make_target, "vpx.sln.mk"],
             cwd=build,
             environment=libvpx_environment,
         )
+        make_arguments.append(solution_make_target)
         make_arguments.append(f"Release_{visual_studio_platform}")
     run(make_arguments, cwd=build, environment=libvpx_environment)
     run([make_executable, "install"], cwd=build, environment=libvpx_environment)
