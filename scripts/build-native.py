@@ -253,18 +253,22 @@ def main() -> int:
         environment,
     )
     copy_license(source_roots["libusb"], arguments.prefix, "libusb", ("COPYING",))
+    pixman_options = [
+        "-Dtests=disabled",
+        "-Ddemos=disabled",
+        "-Dgtk=disabled",
+        "-Dlibpng=disabled",
+        *meson_native_options,
+    ]
+    # Meson's MSVC backend cannot compile Pixman's GNU-style AArch64 assembly sources.
+    if arguments.platform == "windows" and arguments.architecture == "aarch64":
+        pixman_options.append("-Da64-neon=disabled")
     meson_build(
         source_roots["pixman"],
         arguments.work / "build" / "pixman",
         arguments.prefix,
         "static",
-        [
-            "-Dtests=disabled",
-            "-Ddemos=disabled",
-            "-Dgtk=disabled",
-            "-Dlibpng=disabled",
-            *meson_native_options,
-        ],
+        pixman_options,
         environment,
     )
     copy_license(source_roots["pixman"], arguments.prefix, "pixman", ("COPYING",))
