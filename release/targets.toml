@@ -1,0 +1,69 @@
+schema_version = 1
+
+[[target]]
+triple = "x86_64-unknown-linux-gnu"
+runner = "ubuntu-22.04"
+platform = "linux"
+architecture = "x86_64"
+archive = "tar.gz"
+minimum_system_version = "glibc 2.35"
+required_bundled_libraries = ["usbredirhost", "usbredirparser", "libusb-1.0", "gssapi_krb5", "libpcsclite.so.1", "libpcsclite_real.so.1"]
+implicit_bundled_libraries = ["libpcsclite_real.so.1"]
+forbidden_dynamic_libraries = ["pixman", "vpx"]
+
+[[target]]
+triple = "aarch64-unknown-linux-gnu"
+runner = "ubuntu-22.04-arm"
+platform = "linux"
+architecture = "aarch64"
+archive = "tar.gz"
+minimum_system_version = "glibc 2.35"
+required_bundled_libraries = ["usbredirhost", "usbredirparser", "libusb-1.0", "gssapi_krb5", "libpcsclite.so.1", "libpcsclite_real.so.1"]
+implicit_bundled_libraries = ["libpcsclite_real.so.1"]
+forbidden_dynamic_libraries = ["pixman", "vpx"]
+
+[[target]]
+triple = "x86_64-apple-darwin"
+runner = "macos-15-intel"
+platform = "macos"
+architecture = "x86_64"
+archive = "tar.gz"
+minimum_system_version = "macOS 13"
+deployment_target = "13.0"
+required_bundled_libraries = ["usbredirhost", "usbredirparser", "libusb-1.0"]
+implicit_bundled_libraries = []
+forbidden_dynamic_libraries = ["pixman", "vpx"]
+
+[[target]]
+triple = "aarch64-apple-darwin"
+runner = "macos-15"
+platform = "macos"
+architecture = "aarch64"
+archive = "tar.gz"
+minimum_system_version = "macOS 13"
+deployment_target = "13.0"
+required_bundled_libraries = ["usbredirhost", "usbredirparser", "libusb-1.0"]
+implicit_bundled_libraries = []
+forbidden_dynamic_libraries = ["pixman", "vpx"]
+
+[[target]]
+triple = "x86_64-pc-windows-msvc"
+runner = "windows-2022"
+platform = "windows"
+architecture = "x86_64"
+archive = "zip"
+minimum_system_version = "Windows 10 1809"
+required_bundled_libraries = ["usbredirhost", "usbredirparser", "libusb-1.0"]
+implicit_bundled_libraries = []
+forbidden_dynamic_libraries = ["pixman", "vpx", "vcruntime", "msvcp"]
+
+[[target]]
+triple = "aarch64-pc-windows-msvc"
+runner = "windows-11-arm"
+platform = "windows"
+architecture = "aarch64"
+archive = "zip"
+minimum_system_version = "Windows 11 24H2"
+required_bundled_libraries = ["usbredirhost", "usbredirparser", "libusb-1.0"]
+implicit_bundled_libraries = []
+forbidden_dynamic_libraries = ["pixman", "vpx", "vcruntime", "msvcp"]

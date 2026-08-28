@@ -1,0 +1,380 @@
+name: Full helper artifacts
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Release gate
+    runs-on: ubuntu-24.04
+    outputs:
+      release: ${{ steps.release.outputs.release }}
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release ref
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          echo "release=false" >> "$GITHUB_OUTPUT"
+          if [[ "${{ github.event_name }}" != "workflow_dispatch" || "${{ github.ref_type }}" != "tag" ]]; then
+            exit 0
+          fi
+          version=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          expected_tag="v${version}"
+          if [[ "$GITHUB_REF_NAME" != "$expected_tag" ]]; then
+            echo "release ref must be ${expected_tag}, got ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "release tag commit is not contained in origin/main" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse "${GITHUB_REF_NAME}^{commit}")" != "$GITHUB_SHA" ]]; then
+            echo "release tag does not resolve to the workflow commit" >&2
+            exit 1
+          fi
+          if ! git ls-remote --exit-code --tags origin "refs/tags/${GITHUB_REF_NAME}" >/dev/null; then
+            echo "release tag does not exist on origin" >&2
+            exit 1
+          fi
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "GitHub Release ${GITHUB_REF_NAME} already exists" >&2
+            exit 1
+          fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.target }}
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            platform: linux
+            architecture: x86_64
+            archive: tar.gz
+            msvc_arch: ""
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            platform: linux
+            architecture: aarch64
+            archive: tar.gz
+            msvc_arch: ""
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            platform: macos
+            architecture: x86_64
+            archive: tar.gz
+            msvc_arch: ""
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            platform: macos
+            architecture: aarch64
+            archive: tar.gz
+            msvc_arch: ""
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            platform: windows
+            architecture: x86_64
+            archive: zip
+            msvc_arch: x64
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            platform: windows
+            architecture: aarch64
+            archive: zip
+            msvc_arch: arm64
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configure MSVC
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installation = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $installation) { throw "Visual Studio C++ tools were not found" }
+          $module = Join-Path $installation "Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+          $before = @{}
+          Get-ChildItem Env: | ForEach-Object { $before[$_.Name] = $_.Value }
+          Import-Module $module
+          Enter-VsDevShell -VsInstallPath $installation -SkipAutomaticLocation -DevCmdArguments "-arch=${{ matrix.msvc_arch }} -host_arch=x64"
+          Get-ChildItem Env: | Where-Object {
+            -not $before.ContainsKey($_.Name) -or $before[$_.Name] -ne $_.Value
+          } | ForEach-Object {
+            "{0}={1}" -f $_.Name, $_.Value | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install --yes
+          autoconf bison build-essential clang cmake flex libtool libudev-dev nasm
+          ninja-build patchelf perl pkg-config &&
+          python3 -m pip install --disable-pip-version-check --require-hashes
+          --requirement native/build-requirements.txt
+
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        run: brew install automake libtool meson nasm ninja pkg-config
+
+      - name: Install Windows build tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install make nasm pkgconfiglite --yes --no-progress
+          python -m pip install --disable-pip-version-check --require-hashes --requirement native/build-requirements.txt
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.94.1
+          targets: ${{ matrix.target }}
+
+      - name: Select native paths
+        shell: bash
+        run: |
+          {
+            echo "NATIVE_ARCHIVES=${RUNNER_TEMP}/oxide-spice-native-archives"
+            echo "NATIVE_WORK=${RUNNER_TEMP}/oxide-spice-native-work"
+            echo "NATIVE_PREFIX=${RUNNER_TEMP}/oxide-spice-native-prefix"
+            if [[ "${{ matrix.platform }}" == "windows" ]]; then
+              echo "PKG_CONFIG_PATH=${RUNNER_TEMP}/oxide-spice-native-prefix/lib/pkgconfig;${RUNNER_TEMP}/oxide-spice-native-prefix/share/pkgconfig"
+              echo "VCPKG_ROOT=${RUNNER_TEMP}/oxide-spice-disabled-vcpkg"
+              echo "RUSTFLAGS=-C target-feature=+crt-static"
+            else
+              echo "PKG_CONFIG_PATH=${RUNNER_TEMP}/oxide-spice-native-prefix/lib/pkgconfig:${RUNNER_TEMP}/oxide-spice-native-prefix/share/pkgconfig"
+            fi
+            echo "VPX_LIB_DIR=${RUNNER_TEMP}/oxide-spice-native-prefix/lib"
+            echo "VPX_INCLUDE_DIR=${RUNNER_TEMP}/oxide-spice-native-prefix/include"
+            echo "VPX_VERSION=$(python scripts/native-value.py --name libvpx --field version)"
+            echo "VPX_STATIC=1"
+            echo "PIXMAN_1_STATIC=1"
+            echo "LIBGSSAPI_PREFIX=${RUNNER_TEMP}/oxide-spice-native-prefix"
+            echo "OXIDE_SPICE_MINIMUM_SYSTEM_VERSION=$(python scripts/target-value.py --target '${{ matrix.target }}' --field minimum_system_version)"
+            if [[ "${{ matrix.platform }}" == "macos" ]]; then
+              echo "MACOSX_DEPLOYMENT_TARGET=$(python scripts/target-value.py --target '${{ matrix.target }}' --field deployment_target)"
+            fi
+          } >> "$GITHUB_ENV"
+
+      - name: Validate native and release manifests
+        run: python scripts/validate-native-manifest.py
+
+      - name: Fetch pinned native sources
+        run: >-
+          python scripts/fetch-native.py
+          --output "${{ env.NATIVE_ARCHIVES }}"
+          --platform "${{ matrix.platform }}"
+
+      - name: Build pinned native dependencies
+        run: >-
+          python scripts/build-native.py
+          --archives "${{ env.NATIVE_ARCHIVES }}"
+          --work "${{ env.NATIVE_WORK }}"
+          --prefix "${{ env.NATIVE_PREFIX }}"
+          --platform "${{ matrix.platform }}"
+          --architecture "${{ matrix.architecture }}"
+
+      - name: Add native runtime libraries to loader path
+        shell: bash
+        run: |
+          echo "PATH=${NATIVE_PREFIX}/bin:${PATH}" >> "$GITHUB_ENV"
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            echo "LD_LIBRARY_PATH=${NATIVE_PREFIX}/lib" >> "$GITHUB_ENV"
+          elif [[ "${{ matrix.platform }}" == "macos" ]]; then
+            echo "DYLD_LIBRARY_PATH=${NATIVE_PREFIX}/lib" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build full helper
+        run: cargo build --release --locked -p oxide-spice-helper --target "${{ matrix.target }}"
+
+      - name: Verify startup, handshake, credential gate, and cleanup
+        run: >-
+          cargo test --locked -p oxide-spice-helper
+          --target "${{ matrix.target }}"
+          --test stdio_handshake
+
+      - name: Generate SBOM
+        run: >-
+          python scripts/generate-sbom.py
+          --target "${{ matrix.target }}"
+          --output "${{ runner.temp }}/oxide-spice-helper.cdx.json"
+
+      - name: Assemble and audit artifact directory
+        shell: bash
+        run: |
+          helper="target/${{ matrix.target }}/release/oxide-spice-helper"
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then helper="${helper}.exe"; fi
+          python scripts/package-helper.py \
+            --helper "$helper" \
+            --target "${{ matrix.target }}" \
+            --library-root "$NATIVE_PREFIX" \
+            --sbom "${RUNNER_TEMP}/oxide-spice-helper.cdx.json" \
+            --output "${RUNNER_TEMP}/oxide-spice-artifacts"
+
+      - name: Verify packaged helper loads and negotiates
+        run: >-
+          python scripts/verify-packaged-helper.py
+          --directory "${{ runner.temp }}/oxide-spice-artifacts/oxide-spice-helper-${{ matrix.target }}"
+          --target "${{ matrix.target }}"
+          --forbid-loader-root "${{ env.NATIVE_PREFIX }}"
+
+      - name: Archive artifact and write checksum
+        shell: bash
+        run: |
+          directory="${RUNNER_TEMP}/oxide-spice-artifacts/oxide-spice-helper-${{ matrix.target }}"
+          archive="${RUNNER_TEMP}/oxide-spice-artifacts/oxide-spice-helper-${{ matrix.target }}.${{ matrix.archive }}"
+          python scripts/archive-helper.py --directory "$directory" --format "${{ matrix.archive }}" --output "$archive"
+          echo "HELPER_ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - name: Upload candidate for signing
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unsigned-oxide-spice-helper-${{ matrix.target }}
+          path: |
+            ${{ env.HELPER_ARCHIVE }}
+            ${{ env.HELPER_ARCHIVE }}.sha256
+          if-no-files-found: error
+          retention-days: 2
+
+  sign:
+    name: Sign ${{ matrix.target }}
+    if: needs.preflight.outputs.release == 'true'
+    needs: [preflight, build]
+    runs-on: ubuntu-24.04
+    environment: helper-signing
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            archive: zip
+          - target: aarch64-pc-windows-msvc
+            archive: zip
+
+    steps:
+      - name: Install Minisign
+        run: sudo apt-get update && sudo apt-get install --yes minisign
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: unsigned-oxide-spice-helper-${{ matrix.target }}
+          path: candidate
+
+      - name: Sign checksum
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PUBLIC_KEY: ${{ vars.MINISIGN_PUBLIC_KEY }}
+        run: |
+          if [[ -z "${MINISIGN_SECRET_KEY}" ]]; then
+            echo "MINISIGN_SECRET_KEY is required by the helper-signing environment" >&2
+            exit 1
+          fi
+          if [[ -z "${MINISIGN_PUBLIC_KEY}" ]]; then
+            echo "MINISIGN_PUBLIC_KEY is required as an Actions variable" >&2
+            exit 1
+          fi
+          archive="candidate/oxide-spice-helper-${{ matrix.target }}.${{ matrix.archive }}"
+          key_file="${RUNNER_TEMP}/oxide-spice-minisign.key"
+          trap 'rm -f "$key_file"' EXIT
+          umask 077
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key_file"
+          (cd candidate && sha256sum --check "$(basename "${archive}.sha256")")
+          minisign -S -W -s "$key_file" -m "${archive}.sha256" -x "${archive}.sha256.minisig"
+          minisign -V -P "$MINISIGN_PUBLIC_KEY" -m "${archive}.sha256" -x "${archive}.sha256.minisig"
+
+      - name: Upload signed artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: oxide-spice-helper-${{ matrix.target }}
+          path: candidate/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    if: needs.preflight.outputs.release == 'true'
+    needs: [preflight, sign]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.94.1
+
+      - name: Install Minisign
+        run: sudo apt-get update && sudo apt-get install --yes minisign
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: oxide-spice-helper-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Validate release assets
+        env:
+          MINISIGN_PUBLIC_KEY: ${{ vars.MINISIGN_PUBLIC_KEY }}
+        shell: bash
+        run: |
+          if [[ -z "$MINISIGN_PUBLIC_KEY" ]]; then
+            echo "MINISIGN_PUBLIC_KEY is required as an Actions variable" >&2
+            exit 1
+          fi
+          cargo run --quiet --locked -p oxide-spice-helper-protocol --example release-contract > release-contract.json
+          python scripts/validate-release-assets.py \
+            --directory release-assets \
+            --tag "${{ needs.preflight.outputs.tag }}" \
+            --contract release-contract.json
+          for signature in release-assets/*.sha256.minisig; do
+            checksum="${signature%.minisig}"
+            minisign -V -P "$MINISIGN_PUBLIC_KEY" -m "$checksum" -x "$signature"
+          done
+
+      - name: Create immutable GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "GitHub Release ${RELEASE_TAG} already exists" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" release-assets/* \
+            --verify-tag \
+            --title "OxideSpice ${RELEASE_TAG}" \
+            --notes "Versioned full-capability OxideSpice helper artifacts for six supported targets."

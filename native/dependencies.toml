@@ -1,0 +1,117 @@
+schema_version = 1
+
+# Archives fetched outside Cargo. Every download is rejected unless its SHA-256 matches.
+[[source]]
+name = "pixman"
+version = "0.46.4"
+url = "https://cairographics.org/releases/pixman-0.46.4.tar.xz"
+sha256 = "a098c33924754ad43f981b740f6d576c70f9ed1006e12221b1845431ebce1239"
+license = "MIT"
+linkage = "static"
+platforms = ["linux", "macos", "windows"]
+
+[[source]]
+name = "libvpx"
+version = "1.15.2"
+url = "https://github.com/webmproject/libvpx/archive/refs/tags/v1.15.2.tar.gz"
+sha256 = "26fcd3db88045dee380e581862a6ef106f49b74b6396ee95c2993a260b4636aa"
+license = "BSD-3-Clause"
+linkage = "static"
+platforms = ["linux", "macos", "windows"]
+
+[[source]]
+name = "usbredir"
+version = "0.15.0"
+url = "https://gitlab.freedesktop.org/spice/usbredir/-/archive/usbredir-0.15.0/usbredir-usbredir-0.15.0.tar.gz"
+sha256 = "82ae882fcd273e800f3141bf8c820d08aa4e5193e85878575b3721c64f7234fe"
+license = "LGPL-2.1-or-later"
+linkage = "dynamic"
+platforms = ["linux", "macos", "windows"]
+
+[[source]]
+name = "libusb"
+version = "1.0.29"
+url = "https://github.com/libusb/libusb/releases/download/v1.0.29/libusb-1.0.29.tar.bz2"
+sha256 = "5977fc950f8d1395ccea9bd48c06b3f808fd3c2c961b44b0c2e6e29fc3a70a85"
+license = "LGPL-2.1-or-later"
+linkage = "dynamic"
+platforms = ["linux", "macos", "windows"]
+
+[[source]]
+name = "mit-krb5"
+version = "1.22.1"
+url = "https://kerberos.org/dist/krb5/1.22/krb5-1.22.1.tar.gz"
+sha256 = "1a8832b8cad923ebbf1394f67e2efcf41e3a49f460285a66e35adec8fa0053af"
+license = "MIT"
+linkage = "dynamic"
+platforms = ["linux"]
+
+[[source]]
+name = "pcsc-lite"
+version = "2.5.1"
+url = "https://pcsclite.apdu.fr/files/pcsc-lite-2.5.1.tar.xz"
+sha256 = "bfcfe38a20afc49849c6bf55325e38f449fc4b26d3923fdc32b969ae41a8741b"
+license = "BSD-3-Clause"
+linkage = "dynamic-client/system-service"
+platforms = ["linux"]
+
+# Native crates are downloaded and verified by Cargo.lock checksums.
+[[cargo_native]]
+name = "ring"
+version = "0.17.14"
+license = "Apache-2.0 AND ISC"
+linkage = "static"
+
+[[cargo_native]]
+name = "openh264-sys2"
+version = "0.9.8"
+license = "BSD-2-Clause"
+linkage = "static"
+
+[[cargo_native]]
+name = "opusic-sys"
+version = "0.7.5"
+license = "BSD-3-Clause"
+linkage = "static"
+
+[[cargo_native]]
+name = "pixman-sys"
+version = "0.1.0"
+license = "MIT"
+linkage = "static"
+
+[[cargo_native]]
+name = "env-libvpx-sys"
+version = "5.1.3"
+license = "MPL-2.0"
+linkage = "static"
+
+[[cargo_native]]
+name = "usbredirhost-sys"
+version = "0.4.0"
+license = "MIT OR Apache-2.0"
+linkage = "dynamic"
+
+[[cargo_native]]
+name = "usbredirparser-sys"
+version = "0.4.0"
+license = "MIT OR Apache-2.0"
+linkage = "dynamic"
+
+[[cargo_native]]
+name = "libusb1-sys"
+version = "0.7.0"
+license = "MIT"
+linkage = "dynamic"
+
+[[cargo_native]]
+name = "pcsc-sys"
+version = "1.3.0"
+license = "MIT"
+linkage = "platform-client"
+
+[[cargo_native]]
+name = "libgssapi-sys"
+version = "0.3.4"
+license = "MIT"
+linkage = "platform"
