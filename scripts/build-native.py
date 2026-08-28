@@ -92,6 +92,11 @@ def build_libusb(
 ) -> None:
     if platform == "windows":
         visual_studio_platform = "x64" if architecture == "x86_64" else "ARM64"
+        libusb_environment = environment.copy()
+        existing_compiler_options = libusb_environment.get("CL", "").strip()
+        libusb_environment["CL"] = (
+            f"{existing_compiler_options} /wd{MSVC_LIBUSB_MIXED_ENUM_WARNING}".strip()
+        )
         run(
             [
                 "msbuild",
@@ -99,9 +104,8 @@ def build_libusb(
                 "/m",
                 "/p:Configuration=Release-MT",
                 f"/p:Platform={visual_studio_platform}",
-                f"/p:DisableSpecificWarnings={MSVC_LIBUSB_MIXED_ENUM_WARNING}",
             ],
-            environment=environment,
+            environment=libusb_environment,
         )
         dll = next((source / "build").rglob("libusb-1.0.dll"))
         import_library = next((source / "build").rglob("libusb-1.0.lib"))
