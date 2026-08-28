@@ -195,7 +195,8 @@ jobs:
             echo "NATIVE_PREFIX=${RUNNER_TEMP}/oxide-spice-native-prefix"
             echo "PKG_CONFIG_PATH=${RUNNER_TEMP}/oxide-spice-native-prefix/lib/pkgconfig;${RUNNER_TEMP}/oxide-spice-native-prefix/share/pkgconfig"
             echo "VCPKG_ROOT=${RUNNER_TEMP}/oxide-spice-disabled-vcpkg"
-            echo "RUSTFLAGS=-C target-feature=+crt-static"
+            # env-libvpx-sys does not propagate the MSVC archive to final links.
+            echo "RUSTFLAGS=-C target-feature=+crt-static -C link-arg=${RUNNER_TEMP}/oxide-spice-native-prefix/lib/libvpx.lib"
             echo "VPX_LIB_DIR=${RUNNER_TEMP}/oxide-spice-native-prefix/lib"
             echo "VPX_INCLUDE_DIR=${RUNNER_TEMP}/oxide-spice-native-prefix/include"
             echo "VPX_VERSION=$(python scripts/native-value.py --name libvpx --field version)"
