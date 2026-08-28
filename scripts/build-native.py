@@ -178,6 +178,9 @@ def build_libvpx(source: Path, build: Path, prefix: Path, platform: str, archite
         libvpx_environment["PATH"] = os.pathsep.join(
             (str(git_bash_path.parent), libvpx_environment["PATH"])
         )
+        # Native GNU Make otherwise resolves libvpx's shell scripts through WSL.
+        libvpx_environment["SHELL"] = str(git_bash_path)
+        libvpx_environment["MAKESHELL"] = str(git_bash_path)
         command[0] = Path(os.path.relpath(source / "configure", build)).as_posix()
         command[1] = f"--prefix={prefix.resolve().as_posix()}"
         command = [
