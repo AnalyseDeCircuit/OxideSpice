@@ -81,6 +81,17 @@ def copy_license(source: Path, prefix: Path, package: str, candidates: tuple[str
     raise FileNotFoundError(f"license file not found for {package}")
 
 
+def git_bash() -> str:
+    """Resolve Git for Windows Bash without selecting the WSL launcher."""
+    git_executable = shutil.which("git")
+    if git_executable is None:
+        raise FileNotFoundError("git.exe is required to locate Git Bash")
+    candidate = Path(git_executable).parent.parent / "bin" / "bash.exe"
+    if not candidate.is_file():
+        raise FileNotFoundError(f"Git Bash was not found at {candidate}")
+    return str(candidate)
+
+
 def build_libusb(
     source: Path,
     version: str,
@@ -162,7 +173,7 @@ def build_libvpx(source: Path, build: Path, prefix: Path, platform: str, archite
         command.append(f"--target={target_architecture}-darwin24-gcc")
     else:
         command = [
-            "bash",
+            git_bash(),
             *command,
             f"--target={target_architecture}-win64-vs17",
             "--enable-static-msvcrt",
