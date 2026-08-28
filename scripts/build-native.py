@@ -156,6 +156,7 @@ def build_libusb(
 
 def build_libvpx(source: Path, build: Path, prefix: Path, platform: str, architecture: str, environment: dict[str, str]) -> None:
     build.mkdir(parents=True, exist_ok=True)
+    libvpx_environment = environment.copy()
     command = [
         str(source / "configure"),
         f"--prefix={prefix}",
@@ -173,17 +174,21 @@ def build_libvpx(source: Path, build: Path, prefix: Path, platform: str, archite
         command.append(f"--target={target_architecture}-darwin24-gcc")
     else:
         # Relative source paths remain valid in both Git Bash and native Windows make.
+        git_bash_path = Path(git_bash())
+        libvpx_environment["PATH"] = os.pathsep.join(
+            (str(git_bash_path.parent), libvpx_environment["PATH"])
+        )
         command[0] = Path(os.path.relpath(source / "configure", build)).as_posix()
         command[1] = f"--prefix={prefix.resolve().as_posix()}"
         command = [
-            git_bash(),
+            str(git_bash_path),
             *command,
             f"--target={target_architecture}-win64-vs17",
             "--enable-static-msvcrt",
         ]
-    run(command, cwd=build, environment=environment)
-    run(["make", f"-j{os.cpu_count() or 2}"], cwd=build, environment=environment)
-    run(["make", "install"], cwd=build, environment=environment)
+    run(command, cwd=build, environment=libvpx_environment)
+    run(["make", f"-j{os.cpu_count() or 2}"], cwd=build, environment=libvpx_environment)
+    run(["make", "install"], cwd=build, environment=libvpx_environment)
     if platform == "windows":
         installed_library = prefix / "lib" / "vpx.lib"
         if installed_library.is_file():
@@ -252,9 +257,17 @@ def main() -> int:
         "-Dlibpng=disabled",
         *meson_native_options,
     ]
-    # Meson's MSVC backend cannot compile Pixman's GNU-style AArch64 assembly sources.
+    # Meson's MSVC backend cannot compile Pixman's GNU-style AArch64 assembly sources
+    # and its intrinsic probes can incorrectly enable x86 implementations for ARM64.
     if arguments.platform == "windows" and arguments.architecture == "aarch64":
-        pixman_options.append("-Da64-neon=disabled")
+        pixman_options.extend(
+            (
+                "-Da64-neon=disabled",
+                "-Dmmx=disabled",
+                "-Dsse2=disabled",
+                "-Dssse3=disabled",
+            )
+        )
     meson_build(
         source_roots["pixman"],
         arguments.work / "build" / "pixman",
