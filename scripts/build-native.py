@@ -81,6 +81,74 @@ def copy_license(source: Path, prefix: Path, package: str, candidates: tuple[str
     raise FileNotFoundError(f"license file not found for {package}")
 
 
+def prepare_usbredir_msvc(source: Path) -> None:
+    root_meson = source / "meson.build"
+    root_meson_text = root_meson.read_text(encoding="utf-8")
+    visibility_probe = """foreach visibility : [
+    '__attribute__((visibility (\"default\")))',
+    '__attribute__((dllexport))',
+    '__declspec(dllexport)',
+]
+    code = '@0@ int func() { return 123; }'.format(visibility)
+    if compiler.compiles(code, name : 'visibility check')
+	config.set('USBREDIR_VISIBLE', visibility)
+	break
+    endif
+endforeach
+"""
+    if root_meson_text.count(visibility_probe) != 1:
+        raise ValueError("unexpected usbredir visibility probe")
+    # MSVC exports are defined by .def files so declarations and definitions keep matching linkage.
+    root_meson.write_text(root_meson_text.replace(visibility_probe, ""), encoding="utf-8")
+
+    host_source = source / "usbredirhost" / "usbredirhost.c"
+    host_source_text = host_source.read_text(encoding="utf-8")
+    unistd_include = "#include <unistd.h>\n"
+    if host_source_text.count(unistd_include) != 1:
+        raise ValueError("unexpected usbredir unistd include")
+    # usbredirhost does not use unistd APIs, and MSVC does not provide this header.
+    host_source.write_text(host_source_text.replace(unistd_include, ""), encoding="utf-8")
+
+    for library in ("usbredirparser", "usbredirhost"):
+        library_directory = source / library
+        version_script = library_directory / f"{library}.map"
+        exported_symbols = []
+        reading_exports = False
+        for line in version_script.read_text(encoding="utf-8").splitlines():
+            stripped_line = line.strip()
+            if stripped_line == "global:":
+                reading_exports = True
+            elif stripped_line == "local:" or stripped_line.startswith("}"):
+                reading_exports = False
+            elif reading_exports and stripped_line.endswith(";"):
+                exported_symbols.append(stripped_line.removesuffix(";"))
+        if not exported_symbols:
+            raise ValueError(f"no exported symbols found in {version_script}")
+        module_definition = library_directory / f"{library}.def"
+        module_definition.write_text(
+            "EXPORTS\n" + "".join(f"    {symbol}\n" for symbol in exported_symbols),
+            encoding="utf-8",
+        )
+
+        library_meson = library_directory / "meson.build"
+        library_meson_text = library_meson.read_text(encoding="utf-8")
+        link_dependencies = [
+            line
+            for line in library_meson_text.splitlines(keepends=True)
+            if line.startswith("    link_depends : ")
+        ]
+        if len(link_dependencies) != 1:
+            raise ValueError(f"unexpected {library} link dependency")
+        link_dependency = link_dependencies[0]
+        library_meson.write_text(
+            library_meson_text.replace(
+                link_dependency,
+                f"{link_dependency}    vs_module_defs : '{library}.def',\n",
+            ),
+            encoding="utf-8",
+        )
+
+
 def build_libusb(
     source: Path,
     version: str,
@@ -306,6 +374,8 @@ def main() -> int:
         environment,
     )
     copy_license(source_roots["libvpx"], arguments.prefix, "libvpx", ("LICENSE",))
+    if arguments.platform == "windows":
+        prepare_usbredir_msvc(source_roots["usbredir"])
     meson_build(
         source_roots["usbredir"],
         arguments.work / "build" / "usbredir",
