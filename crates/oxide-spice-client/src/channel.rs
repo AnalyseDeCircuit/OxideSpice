@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use oxide_spice_protocol::{
     AUTH_MECHANISM_SASL, AUTH_MECHANISM_SPICE, CapabilitySet, ChannelType, DataHeader, Framing,
-    LINK_HEADER_SIZE, LinkError, LinkHeader, LinkMessage, LinkReply, SubMessageList, SubMessages,
-    WaitForChannels, common_capability, common_client, common_server,
+    LINK_HEADER_SIZE, LinkError, LinkHeader, LinkMessage, LinkReply, ServerNotification,
+    SubMessageList, SubMessages, WaitForChannels, common_capability, common_client, common_server,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
@@ -854,6 +854,12 @@ impl ControlState {
                     reason: read_u32(message.body, 8),
                 });
             }
+            common_server::NOTIFY => {
+                // Notifications carry untrusted diagnostics but no channel state. Validate their
+                // complete wire shape without promoting server text into host logs or errors.
+                let _ = ServerNotification::decode(message.body)?;
+                ControlDisposition::Consumed
+            }
             common_server::MIGRATE => {
                 channel.migrate_to_replacement(message.body).await?;
                 self.generation = 0;
@@ -1201,6 +1207,34 @@ mod tests {
             .expect("padded ping is valid");
         assert_eq!(disposition, ControlDisposition::Consumed);
         server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn server_notification_is_validated_and_consumed_without_dispatch() {
+        let (client_stream, _server_stream) = duplex(1024);
+        let mut channel = test_channel(client_stream);
+        let text = b"keyboard channel is insecure";
+        let mut body = 11_u64.to_le_bytes().to_vec();
+        body.extend_from_slice(&1_u32.to_le_bytes());
+        body.extend_from_slice(&2_u32.to_le_bytes());
+        body.extend_from_slice(&3_u32.to_le_bytes());
+        body.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        body.extend_from_slice(text);
+        let incoming = IncomingMessage {
+            header: DataHeader {
+                serial: None,
+                message_type: common_server::NOTIFY,
+                body_size: body.len() as u32,
+                sub_list_offset: None,
+            },
+            body: &body,
+        };
+
+        let disposition = ControlState::new()
+            .handle(&mut channel, &incoming)
+            .await
+            .expect("valid notification");
+        assert_eq!(disposition, ControlDisposition::Consumed);
     }
 
     #[tokio::test]

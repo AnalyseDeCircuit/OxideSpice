@@ -71,10 +71,10 @@ struct SessionResources {
     input_mouse_events: Option<InputsHandle>,
     input_modifier_events: Option<InputsHandle>,
     agent: AgentHandle,
-    agent_state_events: AgentHandle,
-    agent_offer_events: AgentHandle,
-    agent_audio_events: AgentHandle,
-    agent_graphics_events: AgentHandle,
+    agent_state_events: Option<AgentHandle>,
+    agent_offer_events: Option<AgentHandle>,
+    agent_audio_events: Option<AgentHandle>,
+    agent_graphics_events: Option<AgentHandle>,
     agent_events: Option<AgentEvents>,
     cursor_events: Option<CursorEvents>,
     topology_events: DisplayTopologyEvents,
@@ -185,7 +185,17 @@ pub(crate) async fn run_helper(
     let mut resources = take_session_resources(session);
     let drive_result = drive_session(&mut resources, &mut requests, &events).await;
     let shutdown_result = shutdown_session(resources, &events).await;
-    drive_result.and(shutdown_result)
+    let runtime_result = drive_result.and(shutdown_result);
+    if let Err(error) = &runtime_result {
+        // Post-connect failures must cross the structured IPC boundary after cleanup; stderr is
+        // reserved for process diagnostics and cannot drive the host session state machine.
+        let _ = send_runtime_error(&events, error);
+        let _ = events.send_control(HelperEvent::Status {
+            status: HelperStatus::Failed,
+            message: Some(error.to_string()),
+        });
+    }
+    runtime_result
 }
 
 async fn drive_session(
@@ -228,19 +238,23 @@ async fn drive_session(
                 }
             }
             mouse_mode = next_mouse_mode(&mut resources.input_mouse_events) => {
-                if let Some(mouse_mode) = mouse_mode {
-                    publish_mouse_mode(
-                        mouse_mode.map_err(|error| HelperRuntimeError::HostApi(error.to_string()))?,
-                        events,
-                    )?;
+                match mouse_mode {
+                    Some(Ok(mouse_mode)) => publish_mouse_mode(mouse_mode, events)?,
+                    Some(Err(InputSendError::ChannelClosed)) => {
+                        resources.input_mouse_events = None;
+                    }
+                    Some(Err(error)) => return Err(HelperRuntimeError::HostApi(error.to_string())),
+                    None => {}
                 }
             }
             modifiers = next_keyboard_modifiers(&mut resources.input_modifier_events) => {
-                if let Some(modifiers) = modifiers {
-                    publish_keyboard_modifiers(
-                        modifiers.map_err(|error| HelperRuntimeError::HostApi(error.to_string()))?,
-                        events,
-                    )?;
+                match modifiers {
+                    Some(Ok(modifiers)) => publish_keyboard_modifiers(modifiers, events)?,
+                    Some(Err(InputSendError::ChannelClosed)) => {
+                        resources.input_modifier_events = None;
+                    }
+                    Some(Err(error)) => return Err(HelperRuntimeError::HostApi(error.to_string())),
+                    None => {}
                 }
             }
             frame = resources.session.next_frame() => {
@@ -255,49 +269,73 @@ async fn drive_session(
                 }
             }
             cursor = next_cursor(&mut resources.cursor_events) => {
-                if let Some(cursor) = cursor {
-                    publish_cursor(cursor?, &mut resources.last_cursor_shape, events)?;
+                match cursor {
+                    Some(Ok(cursor)) => {
+                        publish_cursor(cursor, &mut resources.last_cursor_shape, events)?;
+                    }
+                    Some(Err(ClientError::TaskTerminated)) => {
+                        resources.cursor_events = None;
+                    }
+                    Some(Err(error)) => return Err(HelperRuntimeError::Client(error)),
+                    None => {}
                 }
             }
             topology = resources.topology_events.next() => {
                 publish_topology(topology?, events)?;
             }
             agent_event = next_agent_event(&mut resources.agent_events) => {
-                if let Some(agent_event) = agent_event {
-                    publish_agent_event(
-                        agent_event.map_err(|error| HelperRuntimeError::HostApi(error.to_string()))?,
+                match agent_event {
+                    Some(Ok(agent_event)) => publish_agent_event(
+                        agent_event,
                         &mut resources.pending_clipboard_requests,
                         events,
-                    )?;
+                    )?,
+                    Some(Err(AgentSendError::Closed)) => resources.agent_events = None,
+                    Some(Err(error)) => return Err(HelperRuntimeError::HostApi(error.to_string())),
+                    None => {}
                 }
             }
-            offers = resources.agent_offer_events.clipboard_offers_changed() => {
-                publish_clipboard_offers(
-                    offers.map_err(|error| HelperRuntimeError::HostApi(error.to_string()))?,
-                    events,
-                )?;
+            offers = next_agent_clipboard_offers(&mut resources.agent_offer_events) => {
+                match offers {
+                    Some(Ok(offers)) => publish_clipboard_offers(offers, events)?,
+                    Some(Err(AgentSendError::Closed)) => resources.agent_offer_events = None,
+                    Some(Err(error)) => return Err(HelperRuntimeError::HostApi(error.to_string())),
+                    None => {}
+                }
             }
-            agent_state = resources.agent_state_events.changed() => {
-                let agent_state = agent_state
-                    .map_err(|error| HelperRuntimeError::HostApi(error.to_string()))?;
-                publish_agent_state(agent_state, events)?;
+            agent_state = next_agent_state(&mut resources.agent_state_events) => {
+                match agent_state {
+                    Some(Ok(agent_state)) => publish_agent_state(agent_state, events)?,
+                    Some(Err(AgentSendError::Closed)) => resources.agent_state_events = None,
+                    Some(Err(error)) => return Err(HelperRuntimeError::HostApi(error.to_string())),
+                    None => {}
+                }
             }
-            volume = resources.agent_audio_events.audio_volume_changed() => {
-                publish_agent_audio_volume(
-                    volume.map_err(|error| HelperRuntimeError::HostApi(error.to_string()))?,
-                    events,
-                )?;
+            volume = next_agent_audio_volume(&mut resources.agent_audio_events) => {
+                match volume {
+                    Some(Ok(volume)) => publish_agent_audio_volume(volume, events)?,
+                    Some(Err(AgentSendError::Closed)) => {
+                        resources.agent_audio_events = None;
+                        publish_agent_audio_volume(None, events)?;
+                    }
+                    Some(Err(error)) => return Err(HelperRuntimeError::HostApi(error.to_string())),
+                    None => {}
+                }
             }
-            devices = resources.agent_graphics_events.graphics_devices_changed() => {
-                publish_agent_graphics_devices(
-                    devices.map_err(|error| HelperRuntimeError::HostApi(error.to_string()))?,
-                    events,
-                )?;
+            devices = next_agent_graphics_devices(&mut resources.agent_graphics_events) => {
+                match devices {
+                    Some(Ok(devices)) => publish_agent_graphics_devices(devices, events)?,
+                    Some(Err(AgentSendError::Closed)) => {
+                        resources.agent_graphics_events = None;
+                        publish_agent_graphics_devices(None, events)?;
+                    }
+                    Some(Err(error)) => return Err(HelperRuntimeError::HostApi(error.to_string())),
+                    None => {}
+                }
             }
             playback = next_playback(&mut resources.playback_packets) => {
-                if let Some(playback) = playback {
-                    let packet = playback?;
-                    events.send_control(HelperEvent::PlaybackData {
+                match playback {
+                    Some(Ok(packet)) => events.send_control(HelperEvent::PlaybackData {
                         channel_id: packet.channel_id,
                         stream_generation: packet.stream_generation,
                         sequence: packet.sequence,
@@ -306,7 +344,12 @@ async fn drive_session(
                         sample_rate_hz: packet.format.sample_rate_hz,
                         discontinuity: packet.discontinuity,
                         pcm_s16le: packet.interleaved_s16le.to_vec(),
-                    })?;
+                    })?,
+                    Some(Err(ClientError::TaskTerminated)) => {
+                        resources.playback_packets = None;
+                    }
+                    Some(Err(error)) => return Err(HelperRuntimeError::Client(error)),
+                    None => {}
                 }
             }
             _ = record_poll.tick(), if !resources.record_channels.is_empty() || !resources.session.playback_channels().is_empty() => {
@@ -540,10 +583,10 @@ fn take_session_resources(mut session: Session) -> SessionResources {
         input_mouse_events,
         input_modifier_events,
         agent,
-        agent_state_events,
-        agent_offer_events,
-        agent_audio_events,
-        agent_graphics_events,
+        agent_state_events: Some(agent_state_events),
+        agent_offer_events: Some(agent_offer_events),
+        agent_audio_events: Some(agent_audio_events),
+        agent_graphics_events: Some(agent_graphics_events),
         agent_events,
         cursor_events,
         topology_events,
@@ -1948,6 +1991,42 @@ async fn next_agent_event(
 ) -> Option<Result<AgentEvent, AgentSendError>> {
     match events {
         Some(events) => Some(events.next().await),
+        None => std::future::pending().await,
+    }
+}
+
+async fn next_agent_state(
+    agent: &mut Option<AgentHandle>,
+) -> Option<Result<AgentState, AgentSendError>> {
+    match agent {
+        Some(agent) => Some(agent.changed().await),
+        None => std::future::pending().await,
+    }
+}
+
+async fn next_agent_clipboard_offers(
+    agent: &mut Option<AgentHandle>,
+) -> Option<Result<[Option<oxide_spice_client::ClipboardOffer>; 3], AgentSendError>> {
+    match agent {
+        Some(agent) => Some(agent.clipboard_offers_changed().await),
+        None => std::future::pending().await,
+    }
+}
+
+async fn next_agent_audio_volume(
+    agent: &mut Option<AgentHandle>,
+) -> Option<Result<Option<oxide_spice_client::AgentAudioVolumeState>, AgentSendError>> {
+    match agent {
+        Some(agent) => Some(agent.audio_volume_changed().await),
+        None => std::future::pending().await,
+    }
+}
+
+async fn next_agent_graphics_devices(
+    agent: &mut Option<AgentHandle>,
+) -> Option<Result<Option<oxide_spice_client::AgentGraphicsDeviceState>, AgentSendError>> {
+    match agent {
+        Some(agent) => Some(agent.graphics_devices_changed().await),
         None => std::future::pending().await,
     }
 }

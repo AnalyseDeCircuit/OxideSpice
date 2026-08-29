@@ -5,6 +5,8 @@ use crate::{DecodeError, DecodeErrorKind};
 pub const MAX_CHANNEL_WAITS: usize = 64;
 /// Maximum logical messages accepted from one sub-message envelope.
 pub const MAX_SUBMESSAGES: usize = 64;
+/// Maximum untrusted text accepted from one server notification.
+pub const MAX_SERVER_NOTIFICATION_BYTES: usize = 64 * 1024;
 
 /// SPICE channel type values from `spice-protocol`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -337,6 +339,77 @@ pub mod common_client {
     pub const DISCONNECTING: u16 = 6;
 }
 
+/// One informational server notification shared by every SPICE channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerNotification<'a> {
+    pub timestamp: u64,
+    pub severity: u32,
+    pub visibility: u32,
+    pub code: u32,
+    pub message: &'a [u8],
+}
+
+impl<'a> ServerNotification<'a> {
+    /// Decodes the exact fixed fields and bounded message defined by `SpiceMsgNotify`.
+    pub fn decode(body: &'a [u8]) -> Result<Self, DecodeError> {
+        let mut reader = Reader::new(body);
+        let timestamp = reader.u64("notification timestamp")?;
+        let severity = reader.u32("notification severity")?;
+        if severity > 2 {
+            return Err(DecodeError::new(
+                DecodeErrorKind::InvalidValue,
+                8,
+                "notification severity",
+            ));
+        }
+        let visibility = reader.u32("notification visibility")?;
+        if visibility > 2 {
+            return Err(DecodeError::new(
+                DecodeErrorKind::InvalidValue,
+                12,
+                "notification visibility",
+            ));
+        }
+        let code = reader.u32("notification code")?;
+        let message_length =
+            usize::try_from(reader.u32("notification message length")?).map_err(|_| {
+                DecodeError::new(DecodeErrorKind::Overflow, 20, "notification message length")
+            })?;
+        if message_length > MAX_SERVER_NOTIFICATION_BYTES {
+            return Err(DecodeError::new(
+                DecodeErrorKind::ResourceLimit,
+                20,
+                "notification message length",
+            ));
+        }
+        let trailing_terminator =
+            reader.remaining() == message_length.saturating_add(1) && body.last() == Some(&0);
+        if reader.remaining() != message_length && !trailing_terminator {
+            return Err(DecodeError::new(
+                if reader.remaining() < message_length {
+                    DecodeErrorKind::Truncated
+                } else {
+                    DecodeErrorKind::InvalidValue
+                },
+                reader.offset(),
+                "notification message",
+            ));
+        }
+        let message = reader.take(message_length, "notification message")?;
+        if trailing_terminator {
+            // spice-server declares strlen(message) but transmits its terminating NUL as well.
+            let _ = reader.take(1, "notification message terminator")?;
+        }
+        Ok(Self {
+            timestamp,
+            severity,
+            visibility,
+            code,
+            message,
+        })
+    }
+}
+
 /// One cross-channel serial barrier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChannelWait {
@@ -403,6 +476,29 @@ mod tests {
 
         body.push(0);
         let error = WaitForChannels::decode(&body).expect_err("trailing bytes must fail");
+        assert_eq!(error.kind, DecodeErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn server_notification_requires_an_exact_bounded_message() {
+        let message = b"keyboard channel is insecure";
+        let mut body = 7_u64.to_le_bytes().to_vec();
+        body.extend_from_slice(&1_u32.to_le_bytes());
+        body.extend_from_slice(&2_u32.to_le_bytes());
+        body.extend_from_slice(&9_u32.to_le_bytes());
+        body.extend_from_slice(&(message.len() as u32).to_le_bytes());
+        body.extend_from_slice(message);
+
+        let notification = ServerNotification::decode(&body).expect("valid notification");
+        assert_eq!(notification.message, message);
+
+        body.push(0);
+        let notification =
+            ServerNotification::decode(&body).expect("one server terminator is valid");
+        assert_eq!(notification.message, message);
+
+        *body.last_mut().expect("terminator") = 1;
+        let error = ServerNotification::decode(&body).expect_err("nonzero trailing byte must fail");
         assert_eq!(error.kind, DecodeErrorKind::InvalidValue);
     }
 

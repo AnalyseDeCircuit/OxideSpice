@@ -41,8 +41,9 @@ pub use agent::{
 };
 pub use capability::{CapabilitySet, MAX_CAPABILITY_WORDS};
 pub use channel::{
-    ChannelType, ChannelWait, DataHeader, Framing, MAX_CHANNEL_WAITS, MAX_SUBMESSAGES, SubMessage,
-    SubMessageList, SubMessages, WaitForChannels, common_client, common_server,
+    ChannelType, ChannelWait, DataHeader, Framing, MAX_CHANNEL_WAITS,
+    MAX_SERVER_NOTIFICATION_BYTES, MAX_SUBMESSAGES, ServerNotification, SubMessage, SubMessageList,
+    SubMessages, WaitForChannels, common_client, common_server,
 };
 pub use classic_display::{
     DisplayBase, DisplayBrush, DisplayImageSource, DisplayMask, DisplayPath, DrawAlphaBlend,
