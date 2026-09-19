@@ -212,13 +212,20 @@ pub(crate) async fn run_playback<S>(
     state_sender: watch::Sender<PlaybackState>,
     audio_sender: watch::Sender<PlaybackAudioSettings>,
     packet_sender: mpsc::Sender<PlaybackPcmPacket>,
-    connection_generation: u64,
-    channel_id: u8,
     progress: ProgressRegistry,
 ) -> Result<(), ClientError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let PlaybackState::AwaitingMode {
+        connection_generation,
+        channel_id,
+    } = *state_sender.borrow()
+    else {
+        return Err(protocol_value_error(
+            "Playback owner requires its initial channel state",
+        ));
+    };
     let identity = ChannelIdentity {
         channel_type: oxide_spice_protocol::ChannelType::Playback,
         channel_id,
@@ -286,10 +293,8 @@ where
             match message.header.message_type {
                 playback_server::MODE => {
                     let mode = PlaybackMode::decode(message.body)?;
-                    if mode.mode != AudioDataMode::Raw {
-                        if mode.mode != AudioDataMode::Opus {
-                            return Err(unsupported_playback_mode());
-                        }
+                    if mode.mode != AudioDataMode::Raw && mode.mode != AudioDataMode::Opus {
+                        return Err(unsupported_playback_mode());
                     }
                     mode_timestamp_ms = Some(mode.timestamp_ms);
                     data_mode = Some(mode.mode);

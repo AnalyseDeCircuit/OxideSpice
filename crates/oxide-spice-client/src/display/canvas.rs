@@ -767,7 +767,7 @@ impl DashState {
     }
 
     fn foreground(&self) -> bool {
-        self.lengths.is_empty() || (self.index % 2 == 0) != self.starts_with_gap
+        self.lengths.is_empty() || self.index.is_multiple_of(2) != self.starts_with_gap
     }
 
     fn advance(&mut self, mut distance: f64) {

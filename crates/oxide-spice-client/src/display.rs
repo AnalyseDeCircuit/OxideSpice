@@ -1,5 +1,7 @@
 //! Display surface ownership and bounded frame notifications.
 mod canvas;
+mod updates;
+pub(crate) use updates::{DisplayReceiver, DisplaySender, display_updates};
 
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -35,7 +37,7 @@ use pixman::{
     Repeat as PixmanRepeat, Transform as PixmanTransform,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{RwLock, Semaphore, mpsc, oneshot, watch, watch::error::RecvError};
+use tokio::sync::{RwLock, Semaphore, mpsc, oneshot, watch};
 
 use crate::ClientError;
 use crate::channel::{
@@ -60,17 +62,17 @@ const MAX_PALETTE_CACHE_BYTES: usize = 256 * 1024;
 const MAX_ACTIVE_STREAMS: usize = 16;
 /// Builds the preference order from codecs that are present in this binary.
 fn preferred_video_codecs() -> Vec<VideoCodec> {
-    let mut codecs = Vec::with_capacity(5);
-    #[cfg(feature = "video-h264")]
-    codecs.push(VideoCodec::H264);
-    #[cfg(feature = "video-vpx")]
-    codecs.push(VideoCodec::Vp9);
-    #[cfg(feature = "video-h265")]
-    codecs.push(VideoCodec::H265);
-    #[cfg(feature = "video-vpx")]
-    codecs.push(VideoCodec::Vp8);
-    codecs.push(VideoCodec::Mjpeg);
-    codecs
+    vec![
+        #[cfg(feature = "video-h264")]
+        VideoCodec::H264,
+        #[cfg(feature = "video-vpx")]
+        VideoCodec::Vp9,
+        #[cfg(feature = "video-h265")]
+        VideoCodec::H265,
+        #[cfg(feature = "video-vpx")]
+        VideoCodec::Vp8,
+        VideoCodec::Mjpeg,
+    ]
 }
 
 /// Host-facing pixel layout stored by the first Display implementation.
@@ -304,14 +306,14 @@ pub struct DisplayTopology {
 /// Cloneable latest-only topology stream independent from frame consumption.
 #[derive(Clone)]
 pub struct DisplayTopologyEvents {
-    receiver: watch::Receiver<Option<DisplayTopology>>,
+    receiver: DisplayReceiver<DisplayTopology>,
 }
 
 impl std::fmt::Debug for DisplayTopologyEvents {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("DisplayTopologyEvents")
-            .field("latest", &*self.receiver.borrow())
+            .field("latest", &self.receiver.latest())
             .finish_non_exhaustive()
     }
 }
@@ -319,46 +321,27 @@ impl std::fmt::Debug for DisplayTopologyEvents {
 impl DisplayTopologyEvents {
     /// Returns the latest topology after the server has sent Monitors Config.
     pub fn latest(&self) -> Option<DisplayTopology> {
-        self.receiver.borrow().clone()
+        self.receiver.latest()
     }
 
     /// Waits for the next complete topology while intermediate replacements may be coalesced.
     pub async fn next(&mut self) -> Result<DisplayTopology, ClientError> {
-        loop {
-            self.receiver
-                .changed()
-                .await
-                .map_err(|_| ClientError::TaskTerminated)?;
-            if let Some(topology) = self.receiver.borrow_and_update().clone() {
-                return Ok(topology);
-            }
-        }
+        self.receiver.next().await
     }
 }
 
 /// Creates the public topology stream and task-owned sender.
-pub(crate) fn topology_events() -> (
-    watch::Sender<Option<DisplayTopology>>,
-    DisplayTopologyEvents,
-) {
-    let (sender, receiver) = watch::channel(None);
+pub(crate) fn topology_events() -> (DisplaySender<DisplayTopology>, DisplayTopologyEvents) {
+    let (sender, receiver) = display_updates();
     (sender, DisplayTopologyEvents { receiver })
 }
 
 /// Receives latest-only frame notifications while the surface retains all applied updates.
-pub(crate) type FrameReceiver = watch::Receiver<Option<FrameEvent>>;
+pub(crate) type FrameReceiver = DisplayReceiver<FrameEvent>;
 
 /// Waits for the next surface change without allocating or copying frame pixels.
 pub(crate) async fn next_frame(receiver: &mut FrameReceiver) -> Result<FrameEvent, ClientError> {
-    loop {
-        receiver
-            .changed()
-            .await
-            .map_err(|_: RecvError| ClientError::TaskTerminated)?;
-        if let Some(event) = receiver.borrow_and_update().clone() {
-            return Ok(event);
-        }
-    }
+    receiver.next().await
 }
 
 /// Mutable backing storage owned by the Display socket task.
@@ -1414,19 +1397,14 @@ async fn composite_surface_inputs(
     } else {
         Some(source_handle.inner.write().await)
     };
-    let mut mask_guard =
-        if mask_handle.is_some() && !mask_aliases_source && !mask_aliases_destination {
-            Some(
-                mask_handle
-                    .as_ref()
-                    .expect("validated separate mask handle")
-                    .inner
-                    .write()
-                    .await,
-            )
-        } else {
-            None
-        };
+    let mut mask_guard = if let Some(mask) = mask_handle.as_ref()
+        && !mask_aliases_source
+        && !mask_aliases_destination
+    {
+        Some(mask.inner.write().await)
+    } else {
+        None
+    };
 
     let source_format;
     let source_width;
@@ -1773,7 +1751,7 @@ fn render_composite(
     let mask_reference = if mask_uses_source {
         Some(&*source_image)
     } else {
-        mask_image.as_ref().map(|image| &**image)
+        mask_image.as_deref()
     };
     destination_image.composite32(
         operation,
@@ -2006,8 +1984,8 @@ struct Bounds {
 pub(crate) struct DisplayTaskContext {
     pub connection_generation: u64,
     pub display_channel_id: u8,
-    pub frame_sender: watch::Sender<Option<FrameEvent>>,
-    pub topology_sender: watch::Sender<Option<DisplayTopology>>,
+    pub frame_sender: DisplaySender<FrameEvent>,
+    pub topology_sender: DisplaySender<DisplayTopology>,
     pub surface_budget: Arc<SurfaceBudget>,
     pub image_decode_slots: Arc<Semaphore>,
     pub glz_window: Arc<GlzWindow>,
@@ -2080,6 +2058,14 @@ where
     let mut streams: HashMap<u32, StreamRuntime> = HashMap::new();
     let mut palette_cache = PaletteCache::new();
     let mut graphics_epoch = 1_u64;
+    let mut topology = DisplayTopology {
+        connection_generation,
+        graphics_epoch,
+        display_channel_id,
+        maximum_allowed: 0,
+        monitors: Arc::from([]),
+    };
+    let mut explicit_topology = false;
     #[cfg(unix)]
     let mut gl_scanout: Option<Arc<DmaBufScanout>> = None;
     let identity = ChannelIdentity {
@@ -2114,8 +2100,11 @@ where
             graphics_epoch = graphics_epoch
                 .checked_add(1)
                 .ok_or_else(|| resource_limit_error("graphics epoch"))?;
-            frame_sender.send_replace(None);
-            topology_sender.send_replace(None);
+            frame_sender.clear_channel(display_channel_id);
+            topology.graphics_epoch = graphics_epoch;
+            topology.monitors = Arc::from([]);
+            explicit_topology = false;
+            topology_sender.publish((display_channel_id, 0), topology.clone());
             #[cfg(unix)]
             {
                 gl_scanout = None;
@@ -2171,12 +2160,15 @@ where
                     }
                     surfaces.clear();
                     streams.clear();
-                    frame_sender.send_replace(None);
-                    topology_sender.send_replace(None);
+                    frame_sender.clear_channel(display_channel_id);
                     palette_cache.clear();
                     graphics_epoch = graphics_epoch
                         .checked_add(1)
                         .ok_or_else(|| resource_limit_error("graphics epoch"))?;
+                    topology.graphics_epoch = graphics_epoch;
+                    topology.monitors = Arc::from([]);
+                    explicit_topology = false;
+                    topology_sender.publish((display_channel_id, 0), topology.clone());
                     #[cfg(unix)]
                     {
                         gl_scanout = None;
@@ -2199,6 +2191,28 @@ where
                             inner: Arc::new(RwLock::new(surface)),
                         },
                     );
+                    // Servers without MONITORS_CONFIG still need to announce a
+                    // recreated primary surface after an empty reset topology.
+                    if !explicit_topology && create.flags & SURFACE_FLAG_PRIMARY != 0 {
+                        let mut monitors: Vec<_> = surfaces
+                            .values()
+                            .filter(|surface| surface.is_primary)
+                            .map(|surface| MonitorHead {
+                                monitor_id: surface.surface_id,
+                                surface_id: surface.surface_id,
+                                width: surface.width,
+                                height: surface.height,
+                                x: 0,
+                                y: 0,
+                                flags: 0,
+                            })
+                            .collect();
+                        monitors.sort_by_key(|monitor| monitor.monitor_id);
+                        topology.maximum_allowed = u16::try_from(monitors.len())
+                            .map_err(|_| resource_limit_error("monitor count"))?;
+                        topology.monitors = monitors.into();
+                        topology_sender.publish((display_channel_id, 0), topology.clone());
+                    }
                 }
                 display_server::SURFACE_DESTROY => {
                     if message.body.len() != 4 {
@@ -2211,9 +2225,19 @@ where
                         .remove(&surface_id)
                         .is_some_and(|surface| surface.is_primary)
                     {
-                        frame_sender.send_replace(None);
+                        frame_sender.remove((display_channel_id, surface_id));
                     }
                     streams.retain(|_, stream| stream.create.surface_id != surface_id);
+                    let remaining: Vec<_> = topology
+                        .monitors
+                        .iter()
+                        .filter(|monitor| monitor.surface_id != surface_id)
+                        .cloned()
+                        .collect();
+                    if remaining.len() != topology.monitors.len() {
+                        topology.monitors = remaining.into();
+                        topology_sender.publish((display_channel_id, 0), topology.clone());
+                    }
                 }
                 display_server::MONITORS_CONFIG => {
                     let config = MonitorsConfig::decode(message.body)?;
@@ -2233,13 +2257,15 @@ where
                             return Err(protocol_value_error("monitor exceeds surface bounds"));
                         }
                     }
-                    topology_sender.send_replace(Some(DisplayTopology {
+                    topology = DisplayTopology {
                         connection_generation,
                         graphics_epoch,
                         display_channel_id,
                         maximum_allowed: config.maximum_allowed,
                         monitors: config.heads.into(),
-                    }));
+                    };
+                    explicit_topology = true;
+                    topology_sender.publish((display_channel_id, 0), topology.clone());
                 }
                 display_server::STREAM_CREATE => {
                     let create = StreamCreate::decode(message.body)?;
@@ -2950,7 +2976,7 @@ fn surface_for_update(
 
 /// Replaces the latest notification; the shared surface preserves all intermediate updates.
 fn notify_surface(
-    sender: &watch::Sender<Option<FrameEvent>>,
+    sender: &DisplaySender<FrameEvent>,
     connection_generation: u64,
     graphics_epoch: u64,
     surface_id: u32,
@@ -2960,15 +2986,18 @@ fn notify_surface(
     if !surface.is_primary {
         return;
     }
-    sender.send_replace(Some(FrameEvent {
-        connection_generation,
-        graphics_epoch,
-        display_channel_id: surface.display_channel_id,
-        surface_id,
-        dirty,
-        full_refresh_required: true,
-        surface,
-    }));
+    sender.publish(
+        (surface.display_channel_id, surface_id),
+        FrameEvent {
+            connection_generation,
+            graphics_epoch,
+            display_channel_id: surface.display_channel_id,
+            surface_id,
+            dirty,
+            full_refresh_required: true,
+            surface,
+        },
+    );
 }
 
 /// Creates a structured resource-limit failure using the protocol error path.
