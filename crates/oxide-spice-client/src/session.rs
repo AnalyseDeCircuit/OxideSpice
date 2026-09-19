@@ -32,8 +32,8 @@ use crate::channel::{
 };
 use crate::cursor::{CursorEvents, CursorState, cursor_events, run_cursor};
 use crate::display::{
-    DisplayTaskContext, FrameEvent, FrameReceiver, glz_window, image_decode_slots,
-    initialize_display_channel, next_frame, run_display, surface_budget,
+    DisplaySender, DisplayTaskContext, FrameEvent, FrameReceiver, display_updates, glz_window,
+    image_decode_slots, initialize_display_channel, next_frame, run_display, surface_budget,
 };
 use crate::display::{DisplayTopology, DisplayTopologyEvents, topology_events};
 #[cfg(unix)]
@@ -128,8 +128,8 @@ struct LinkedPort {
 struct SupervisorSignals {
     cancel_sender: watch::Sender<bool>,
     cancel_receiver: watch::Receiver<bool>,
-    frame_sender: watch::Sender<Option<FrameEvent>>,
-    topology_sender: watch::Sender<Option<DisplayTopology>>,
+    frame_sender: DisplaySender<FrameEvent>,
+    topology_sender: DisplaySender<DisplayTopology>,
     mouse_mode_sender: watch::Sender<MouseMode>,
     mouse_mode_receiver: watch::Receiver<MouseMode>,
     server_identity_sender: watch::Sender<ServerIdentity>,
@@ -1040,7 +1040,7 @@ impl Session {
         let connection_generation = INITIAL_CONNECTION_GENERATION;
         let (agent, agent_events, agent_task_paths) = agent_paths(connection_generation);
         let (cancel_sender, cancel_receiver) = watch::channel(false);
-        let (frame_sender, frame_receiver) = watch::channel(None);
+        let (frame_sender, frame_receiver) = display_updates();
         #[cfg(unix)]
         let (gl_frame_sender, gl_frame_events) = gl_frame_events();
         let (topology_sender, topology_events) = topology_events();
@@ -2080,8 +2080,6 @@ async fn supervise_channels(
             playback.state_sender,
             playback.audio_sender,
             playback.packet_sender,
-            connection_generation,
-            playback.channel_id,
             progress.clone(),
         ));
     }
@@ -3164,6 +3162,10 @@ mod tests {
                 &[],
             )
             .await;
+            // Keep the channel empty until the client observes the reset itself.
+            let (message_type, key) = read_mini_message(&mut inputs_stream).await;
+            assert_eq!(message_type, oxide_spice_protocol::inputs_client::KEY_DOWN);
+            assert_eq!(key, 0x30_u32.to_le_bytes());
             write_mini_message(
                 &mut display_stream,
                 oxide_spice_protocol::display_server::SURFACE_CREATE,
@@ -3263,6 +3265,16 @@ mod tests {
                 &mut second_display_stream,
                 oxide_spice_protocol::display_server::INVALIDATE_PALETTE,
                 &99_u64.to_le_bytes(),
+            )
+            .await;
+
+            let (message_type, key) = read_mini_message(&mut inputs_stream).await;
+            assert_eq!(message_type, oxide_spice_protocol::inputs_client::KEY_DOWN);
+            assert_eq!(key, 0x31_u32.to_le_bytes());
+            write_mini_message(
+                &mut second_display_stream,
+                oxide_spice_protocol::display_server::SURFACE_DESTROY,
+                &0_u32.to_le_bytes(),
             )
             .await;
 
@@ -3576,6 +3588,11 @@ mod tests {
             .await
             .expect("topology after Display Reset");
         assert_eq!(topology.graphics_epoch, 2);
+        assert_eq!(topology.monitors.as_ref(), &[]);
+        inputs
+            .key_down(0x30)
+            .await
+            .expect("allow primary surface recreation");
         let frame = session
             .next_frame()
             .await
@@ -3587,6 +3604,12 @@ mod tests {
             .await
             .expect("second surface snapshot");
         assert_eq!(snapshot.pixels, &[0x60, 0x50, 0x40, u8::MAX]);
+        let topology = topology_events.next().await.expect("recreated topology");
+        assert_eq!(
+            (topology.display_channel_id, topology.graphics_epoch),
+            (0, 2)
+        );
+        assert_eq!(topology.monitors[0].surface_id, 0);
 
         inputs
             .key_up(0x1E)
@@ -3607,6 +3630,20 @@ mod tests {
             .await
             .expect("second Display surface snapshot");
         assert_eq!(snapshot.pixels, &[0x90, 0x80, 0x70, u8::MAX]);
+
+        inputs
+            .key_down(0x31)
+            .await
+            .expect("remove second display surface");
+        let topology = timeout(TEST_MESSAGE_TIMEOUT, topology_events.next())
+            .await
+            .expect("surface removal topology timeout")
+            .expect("surface removal topology");
+        assert_eq!(
+            (topology.display_channel_id, topology.graphics_epoch),
+            (1, 1)
+        );
+        assert_eq!(topology.monitors.as_ref(), &[]);
 
         session.shutdown().await.expect("clean session shutdown");
         server.await.expect("fake server task");
@@ -3832,7 +3869,6 @@ mod tests {
                     main_capability::SEAMLESS_MIGRATION,
                 ],
                 ChannelType::Display => &[
-                    display_capability::COMPOSITE,
                     display_capability::A8_SURFACE,
                     display_capability::LZ4_COMPRESSION,
                 ],
@@ -3840,6 +3876,12 @@ mod tests {
             };
             for capability in required_capabilities {
                 assert_ne!(channel_word & (1 << capability), 0);
+            }
+            if expected_channel_type == ChannelType::Display {
+                assert_eq!(
+                    channel_word & (1 << display_capability::COMPOSITE) != 0,
+                    cfg!(feature = "composite-pixman")
+                );
             }
         }
 

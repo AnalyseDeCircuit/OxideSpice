@@ -98,7 +98,7 @@ struct SessionResources {
     port_tasks: JoinSet<u8>,
     background_tasks: JoinSet<()>,
     pending_clipboard_requests: HashMap<u64, oxide_spice_client::ClipboardRequest>,
-    last_cursor_shape: Option<(u64, u64)>,
+    last_cursor_shape: CursorShapeCache,
 }
 
 struct IntegrationCompletion {
@@ -193,7 +193,7 @@ async fn drive_session(
     requests: &mut mpsc::Receiver<HelperRequest>,
     events: &EventSender,
 ) -> Result<(), HelperRuntimeError> {
-    let capabilities = session_capabilities(&resources);
+    let capabilities = session_capabilities(resources);
     let server_identity = resources.session.server_identity();
     events.send_control(HelperEvent::Connected {
         session_id: resources.session.session_id(),
@@ -208,12 +208,12 @@ async fn drive_session(
         message: None,
     })?;
     if let Some(inputs) = resources.inputs.as_ref() {
-        publish_mouse_mode(inputs.mouse_mode(), &events)?;
-        publish_keyboard_modifiers(inputs.modifiers_state(), &events)?;
+        publish_mouse_mode(inputs.mouse_mode(), events)?;
+        publish_keyboard_modifiers(inputs.modifiers_state(), events)?;
     }
-    publish_agent_state(resources.agent.state(), &events)?;
-    publish_agent_audio_volume(resources.agent.audio_volume(), &events)?;
-    publish_agent_graphics_devices(resources.agent.graphics_devices(), &events)?;
+    publish_agent_state(resources.agent.state(), events)?;
+    publish_agent_audio_volume(resources.agent.audio_volume(), events)?;
+    publish_agent_graphics_devices(resources.agent.graphics_devices(), events)?;
     start_generic_port_bridges(resources, events.clone());
 
     let mut record_poll = tokio::time::interval(RECORD_STATE_POLL_INTERVAL);
@@ -554,7 +554,7 @@ fn take_session_resources(mut session: Session) -> SessionResources {
         record_states: HashMap::new(),
         record_settings: HashMap::new(),
         pending_clipboard_requests: HashMap::new(),
-        last_cursor_shape: None,
+        last_cursor_shape: CursorShapeCache::default(),
     }
 }
 
@@ -1365,23 +1365,6 @@ fn native_inventory<T>(result: Result<Vec<T>, String>) -> (Vec<T>, HelperNativeB
     }
 }
 
-#[cfg(test)]
-mod native_inventory_tests {
-    use super::*;
-
-    #[test]
-    fn unavailable_service_keeps_a_typed_reason() {
-        let (devices, status) = native_inventory::<u8>(Err("service unavailable".to_owned()));
-        assert!(devices.is_empty());
-        assert_eq!(
-            status,
-            HelperNativeBackendStatus::Unavailable {
-                reason: "service unavailable".to_owned(),
-            }
-        );
-    }
-}
-
 #[cfg(feature = "usbredir")]
 async fn discover_usb_devices() -> Result<Vec<HelperUsbDeviceIdentity>, String> {
     tokio::task::spawn_blocking(list_usb_devices)
@@ -1475,16 +1458,38 @@ async fn publish_frame(
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CursorShapeIdentity {
+    connection: u64,
+    channel: u8,
+    epoch: u64,
+    shape: u64,
+}
+
+#[derive(Default)]
+struct CursorShapeCache {
+    last: Option<(CursorShapeIdentity, std::sync::Arc<[u8]>)>,
+}
+
+impl CursorShapeCache {
+    fn encode(&mut self, identity: CursorShapeIdentity, pixels: &std::sync::Arc<[u8]>) -> Vec<u8> {
+        if self.last.as_ref().is_some_and(|(previous, data)| {
+            *previous == identity && std::sync::Arc::ptr_eq(data, pixels)
+        }) {
+            return Vec::new();
+        }
+        // Retain only the last delivered shape. Pointer identity also distinguishes
+        // uncached shapes whose server-supplied id may be reused (including zero).
+        self.last = Some((identity, pixels.clone()));
+        pixels.to_vec()
+    }
+}
+
 fn publish_cursor(
     cursor: oxide_spice_client::CursorState,
-    last_shape: &mut Option<(u64, u64)>,
+    last_shape: &mut CursorShapeCache,
     events: &EventSender,
 ) -> Result<(), HelperIpcError> {
-    let shape_key = cursor
-        .shape
-        .as_ref()
-        .map(|shape| (cursor.cursor_epoch, shape.unique_id));
-    let include_shape = shape_key.is_some() && shape_key != *last_shape;
     let (width, height, hot_spot_x, hot_spot_y, shape_id, rgba) = match cursor.shape {
         Some(shape) => (
             shape.width,
@@ -1492,13 +1497,21 @@ fn publish_cursor(
             shape.hot_spot_x,
             shape.hot_spot_y,
             Some(shape.unique_id),
-            include_shape
-                .then(|| shape.rgba.to_vec())
-                .unwrap_or_default(),
+            last_shape.encode(
+                CursorShapeIdentity {
+                    connection: cursor.connection_generation,
+                    channel: cursor.channel_id,
+                    epoch: cursor.cursor_epoch,
+                    shape: shape.unique_id,
+                },
+                &shape.rgba,
+            ),
         ),
-        None => (0, 0, 0, 0, None, Vec::new()),
+        None => {
+            last_shape.last = None;
+            (0, 0, 0, 0, None, Vec::new())
+        }
     };
-    *last_shape = shape_key;
     events.send_control(HelperEvent::Cursor {
         connection_generation: cursor.connection_generation,
         cursor_epoch: cursor.cursor_epoch,
@@ -2099,4 +2112,57 @@ fn input_error(error: InputSendError) -> String {
 
 fn agent_error(error: AgentSendError) -> String {
     error.to_string()
+}
+
+#[cfg(test)]
+mod native_inventory_tests {
+    use super::*;
+
+    #[test]
+    fn cursor_payload_is_reused_only_within_the_same_identity() {
+        let mut cache = CursorShapeCache::default();
+        let red: std::sync::Arc<[u8]> = [255, 0, 0, 255].into();
+        let blue: std::sync::Arc<[u8]> = [0, 0, 255, 255].into();
+        let first = CursorShapeIdentity {
+            connection: 1,
+            channel: 0,
+            epoch: 1,
+            shape: 0,
+        };
+        for identity in [
+            first,
+            CursorShapeIdentity {
+                channel: 1,
+                ..first
+            },
+            CursorShapeIdentity {
+                connection: 2,
+                channel: 1,
+                ..first
+            },
+            CursorShapeIdentity {
+                connection: 2,
+                channel: 1,
+                epoch: 2,
+                ..first
+            },
+            first,
+        ] {
+            assert_eq!(cache.encode(identity, &red), [255, 0, 0, 255]);
+            assert_eq!(cache.encode(identity, &red), Vec::<u8>::new());
+        }
+        assert_eq!(cache.encode(first, &blue), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn unavailable_service_keeps_a_typed_reason() {
+        let (devices, status) = native_inventory::<u8>(Err("service unavailable".to_owned()));
+        assert!(devices.is_empty());
+        assert_eq!(
+            status,
+            HelperNativeBackendStatus::Unavailable {
+                reason: "service unavailable".to_owned(),
+            }
+        );
+    }
 }

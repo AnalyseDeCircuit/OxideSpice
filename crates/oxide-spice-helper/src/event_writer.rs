@@ -128,12 +128,16 @@ impl EventSender {
         if queue.closed {
             return Err(closed_queue_error());
         }
-        if queue
+        // Only a full snapshot of the same surface may supersede an earlier frame.
+        // Control events form ordering barriers, including topology and reset events.
+        if let Some(queued) = queue
             .events
-            .back()
-            .is_some_and(|queued| queued.written.is_none() && is_frame(&queued.event))
+            .iter_mut()
+            .rev()
+            .take_while(|queued| queued.written.is_none() && is_frame(&queued.event))
+            .find(|queued| replaces_frame(&queued.event, &event))
         {
-            queue.events.back_mut().expect("frame exists").event = event;
+            queued.event = event;
         } else {
             if queue.events.len() >= EVENT_QUEUE_CAPACITY {
                 return Err(HelperIpcError::Io(std::io::Error::other(
@@ -187,6 +191,37 @@ fn is_frame(event: &HelperEvent) -> bool {
     matches!(event, HelperEvent::Frame { .. })
 }
 
+fn replaces_frame(previous: &HelperEvent, incoming: &HelperEvent) -> bool {
+    match (previous, incoming) {
+        (
+            HelperEvent::Frame {
+                connection_generation: old_generation,
+                graphics_epoch: old_epoch,
+                display_channel_id: old_channel,
+                surface_id: old_surface,
+                ..
+            },
+            HelperEvent::Frame {
+                connection_generation,
+                graphics_epoch,
+                display_channel_id,
+                surface_id,
+                full_refresh: true,
+                ..
+            },
+        ) => {
+            (old_generation, old_epoch, old_channel, old_surface)
+                == (
+                    connection_generation,
+                    graphics_epoch,
+                    display_channel_id,
+                    surface_id,
+                )
+        }
+        _ => false,
+    }
+}
+
 fn poisoned_queue_error() -> HelperIpcError {
     HelperIpcError::Io(std::io::Error::other("helper event queue lock is poisoned"))
 }
@@ -196,4 +231,68 @@ fn closed_queue_error() -> HelperIpcError {
         std::io::ErrorKind::BrokenPipe,
         "helper event queue is closed",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxide_spice_helper_protocol::{HelperPixelFormat, HelperRect};
+
+    #[test]
+    fn coalesces_only_the_same_surface_before_a_control_barrier() {
+        let shared = Arc::new((
+            Mutex::new(EventQueue {
+                events: VecDeque::new(),
+                closed: false,
+            }),
+            Condvar::new(),
+        ));
+        let sender = EventSender {
+            shared: shared.clone(),
+        };
+        let frame = |channel, pixel| HelperEvent::Frame {
+            connection_generation: 1,
+            graphics_epoch: 1,
+            display_channel_id: channel,
+            surface_id: 0,
+            surface_width: 1,
+            surface_height: 1,
+            rect: HelperRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            full_refresh: true,
+            format: HelperPixelFormat::Rgba8,
+            pixels: vec![pixel, 0, 0, 255],
+        };
+        sender.send_frame(frame(0, 10)).unwrap();
+        sender.send_frame(frame(1, 20)).unwrap();
+        sender.send_frame(frame(0, 30)).unwrap();
+        sender
+            .send_control(HelperEvent::KeyboardModifiers { bits: 0 })
+            .unwrap();
+        sender.send_frame(frame(0, 40)).unwrap();
+        let actual = shared
+            .0
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .map(|queued| match &queued.event {
+                HelperEvent::Frame {
+                    display_channel_id,
+                    pixels,
+                    ..
+                } => Some((*display_channel_id, pixels[0])),
+                HelperEvent::KeyboardModifiers { .. } => None,
+                _ => panic!("unexpected event"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![Some((0, 30)), Some((1, 20)), None, Some((0, 40))]
+        );
+    }
 }

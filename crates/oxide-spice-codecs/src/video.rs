@@ -51,7 +51,7 @@ enum DecoderBackend {
     #[cfg(feature = "video-h264")]
     H264(openh264::decoder::Decoder),
     #[cfg(feature = "video-h265")]
-    H265(rust_h265::Decoder),
+    H265(Box<rust_h265::Decoder>),
 }
 
 /// Stateful decoder owner isolated from protocol and async network code.
@@ -108,7 +108,7 @@ impl SpiceVideoDecoder {
             #[cfg(not(feature = "video-h264"))]
             SpiceVideoCodec::H264 => return Err(VideoDecodeError::Unavailable("H.264")),
             #[cfg(feature = "video-h265")]
-            SpiceVideoCodec::H265 => DecoderBackend::H265(rust_h265::Decoder::new()),
+            SpiceVideoCodec::H265 => DecoderBackend::H265(Box::new(rust_h265::Decoder::new())),
             #[cfg(not(feature = "video-h265"))]
             SpiceVideoCodec::H265 => return Err(VideoDecodeError::Unavailable("H.265")),
         };

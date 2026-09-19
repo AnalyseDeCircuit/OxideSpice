@@ -1069,7 +1069,7 @@ dependencies = [
 
 [[package]]
 name = "oxide-spice-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "cross-krb5",
@@ -1091,7 +1091,7 @@ dependencies = [
 
 [[package]]
 name = "oxide-spice-codecs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "jpeg-decoder",
  "jpeg-encoder",
@@ -1107,7 +1107,7 @@ dependencies = [
 
 [[package]]
 name = "oxide-spice-helper"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dav-server",
  "hyper",
@@ -1123,7 +1123,7 @@ dependencies = [
 
 [[package]]
 name = "oxide-spice-helper-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "oxide-spice-protocol",
  "serde",
@@ -1134,7 +1134,7 @@ dependencies = [
 
 [[package]]
 name = "oxide-spice-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "thiserror 2.0.20",
 ]

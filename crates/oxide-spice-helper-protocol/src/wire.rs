@@ -765,23 +765,21 @@ pub enum HelperEvent {
     rename_all_fields = "camelCase"
 )]
 enum BinaryRequestHeader {
-    ClipboardProvideBinary {
-        request_id: u64,
-        payload_len: usize,
-    },
-    RecordDataBinary {
+    #[serde(rename = "clipboardProvideBinary")]
+    ClipboardProvide { request_id: u64, payload_len: usize },
+    #[serde(rename = "recordDataBinary")]
+    RecordData {
         channel_id: u8,
         timestamp_ms: u32,
         payload_len: usize,
     },
-    FileTransferDataBinary {
+    #[serde(rename = "fileTransferDataBinary")]
+    FileTransferData {
         transfer_id: u64,
         payload_len: usize,
     },
-    PortWriteBinary {
-        channel_id: u8,
-        payload_len: usize,
-    },
+    #[serde(rename = "portWriteBinary")]
+    PortWrite { channel_id: u8, payload_len: usize },
 }
 
 #[derive(Deserialize)]
@@ -801,7 +799,8 @@ enum InitialRequest {
     rename_all_fields = "camelCase"
 )]
 enum BinaryEventHeader {
-    FrameBinary {
+    #[serde(rename = "frameBinary")]
+    Frame {
         connection_generation: u64,
         graphics_epoch: u64,
         display_channel_id: u8,
@@ -813,7 +812,8 @@ enum BinaryEventHeader {
         format: HelperPixelFormat,
         payload_len: usize,
     },
-    CursorBinary {
+    #[serde(rename = "cursorBinary")]
+    Cursor {
         connection_generation: u64,
         cursor_epoch: u64,
         channel_id: u8,
@@ -827,12 +827,14 @@ enum BinaryEventHeader {
         shape_id: Option<u64>,
         payload_len: usize,
     },
-    ClipboardDataBinary {
+    #[serde(rename = "clipboardDataBinary")]
+    ClipboardData {
         selection: HelperClipboardSelection,
         format: HelperClipboardFormat,
         payload_len: usize,
     },
-    PlaybackDataBinary {
+    #[serde(rename = "playbackDataBinary")]
+    PlaybackData {
         channel_id: u8,
         stream_generation: u64,
         sequence: u64,
@@ -842,7 +844,8 @@ enum BinaryEventHeader {
         discontinuity: bool,
         payload_len: usize,
     },
-    PortDataBinary {
+    #[serde(rename = "portDataBinary")]
+    PortData {
         channel_id: u8,
         discontinuity: bool,
         payload_len: usize,
@@ -891,30 +894,30 @@ pub fn read_request(reader: &mut impl BufRead) -> Result<Option<HelperRequest>, 
     };
     if let Ok(header) = serde_json::from_str::<BinaryRequestHeader>(&line) {
         let payload_len = match header {
-            BinaryRequestHeader::ClipboardProvideBinary { payload_len, .. }
-            | BinaryRequestHeader::RecordDataBinary { payload_len, .. }
-            | BinaryRequestHeader::FileTransferDataBinary { payload_len, .. }
-            | BinaryRequestHeader::PortWriteBinary { payload_len, .. } => payload_len,
+            BinaryRequestHeader::ClipboardProvide { payload_len, .. }
+            | BinaryRequestHeader::RecordData { payload_len, .. }
+            | BinaryRequestHeader::FileTransferData { payload_len, .. }
+            | BinaryRequestHeader::PortWrite { payload_len, .. } => payload_len,
         };
-        if matches!(header, BinaryRequestHeader::FileTransferDataBinary { .. })
+        if matches!(header, BinaryRequestHeader::FileTransferData { .. })
             && payload_len > oxide_spice_protocol::MAX_AGENT_FILE_CHUNK_BYTES
         {
             return Err(HelperIpcError::FileTransferChunkTooLarge);
         }
-        if matches!(header, BinaryRequestHeader::PortWriteBinary { .. })
+        if matches!(header, BinaryRequestHeader::PortWrite { .. })
             && payload_len > oxide_spice_protocol::MAX_PORT_DATA_BYTES
         {
             return Err(HelperIpcError::PortPayloadTooLarge);
         }
         let payload = read_payload(reader, payload_len)?;
         return Ok(Some(match header {
-            BinaryRequestHeader::ClipboardProvideBinary { request_id, .. } => {
+            BinaryRequestHeader::ClipboardProvide { request_id, .. } => {
                 HelperRequest::ClipboardProvide {
                     request_id,
                     data: payload,
                 }
             }
-            BinaryRequestHeader::RecordDataBinary {
+            BinaryRequestHeader::RecordData {
                 channel_id,
                 timestamp_ms,
                 ..
@@ -923,13 +926,13 @@ pub fn read_request(reader: &mut impl BufRead) -> Result<Option<HelperRequest>, 
                 timestamp_ms,
                 pcm_s16le: payload,
             },
-            BinaryRequestHeader::FileTransferDataBinary { transfer_id, .. } => {
+            BinaryRequestHeader::FileTransferData { transfer_id, .. } => {
                 HelperRequest::FileTransferData {
                     transfer_id,
                     data: payload,
                 }
             }
-            BinaryRequestHeader::PortWriteBinary { channel_id, .. } => HelperRequest::PortWrite {
+            BinaryRequestHeader::PortWrite { channel_id, .. } => HelperRequest::PortWrite {
                 channel_id,
                 data: payload,
             },
@@ -945,7 +948,7 @@ pub fn write_request(
     match request {
         HelperRequest::ClipboardProvide { request_id, data } => write_binary(
             writer,
-            &BinaryRequestHeader::ClipboardProvideBinary {
+            &BinaryRequestHeader::ClipboardProvide {
                 request_id: *request_id,
                 payload_len: data.len(),
             },
@@ -957,7 +960,7 @@ pub fn write_request(
             pcm_s16le,
         } => write_binary(
             writer,
-            &BinaryRequestHeader::RecordDataBinary {
+            &BinaryRequestHeader::RecordData {
                 channel_id: *channel_id,
                 timestamp_ms: *timestamp_ms,
                 payload_len: pcm_s16le.len(),
@@ -970,7 +973,7 @@ pub fn write_request(
             }
             write_binary(
                 writer,
-                &BinaryRequestHeader::FileTransferDataBinary {
+                &BinaryRequestHeader::FileTransferData {
                     transfer_id: *transfer_id,
                     payload_len: data.len(),
                 },
@@ -983,7 +986,7 @@ pub fn write_request(
             }
             write_binary(
                 writer,
-                &BinaryRequestHeader::PortWriteBinary {
+                &BinaryRequestHeader::PortWrite {
                     channel_id: *channel_id,
                     payload_len: data.len(),
                 },
@@ -1009,7 +1012,7 @@ pub fn write_event(writer: &mut impl Write, event: &HelperEvent) -> Result<(), H
             pixels,
         } => write_binary(
             writer,
-            &BinaryEventHeader::FrameBinary {
+            &BinaryEventHeader::Frame {
                 connection_generation: *connection_generation,
                 graphics_epoch: *graphics_epoch,
                 display_channel_id: *display_channel_id,
@@ -1038,7 +1041,7 @@ pub fn write_event(writer: &mut impl Write, event: &HelperEvent) -> Result<(), H
             rgba,
         } if !rgba.is_empty() => write_binary(
             writer,
-            &BinaryEventHeader::CursorBinary {
+            &BinaryEventHeader::Cursor {
                 connection_generation: *connection_generation,
                 cursor_epoch: *cursor_epoch,
                 channel_id: *channel_id,
@@ -1060,7 +1063,7 @@ pub fn write_event(writer: &mut impl Write, event: &HelperEvent) -> Result<(), H
             data,
         } => write_binary(
             writer,
-            &BinaryEventHeader::ClipboardDataBinary {
+            &BinaryEventHeader::ClipboardData {
                 selection: *selection,
                 format: *format,
                 payload_len: data.len(),
@@ -1078,7 +1081,7 @@ pub fn write_event(writer: &mut impl Write, event: &HelperEvent) -> Result<(), H
             pcm_s16le,
         } => write_binary(
             writer,
-            &BinaryEventHeader::PlaybackDataBinary {
+            &BinaryEventHeader::PlaybackData {
                 channel_id: *channel_id,
                 stream_generation: *stream_generation,
                 sequence: *sequence,
@@ -1096,7 +1099,7 @@ pub fn write_event(writer: &mut impl Write, event: &HelperEvent) -> Result<(), H
             data,
         } => write_binary(
             writer,
-            &BinaryEventHeader::PortDataBinary {
+            &BinaryEventHeader::PortData {
                 channel_id: *channel_id,
                 discontinuity: *discontinuity,
                 payload_len: data.len(),
@@ -1115,15 +1118,15 @@ pub fn read_event(reader: &mut impl BufRead) -> Result<Option<HelperEvent>, Help
         return Ok(Some(serde_json::from_str(&line)?));
     };
     let payload_len = match &header {
-        BinaryEventHeader::FrameBinary { payload_len, .. }
-        | BinaryEventHeader::CursorBinary { payload_len, .. }
-        | BinaryEventHeader::ClipboardDataBinary { payload_len, .. }
-        | BinaryEventHeader::PlaybackDataBinary { payload_len, .. }
-        | BinaryEventHeader::PortDataBinary { payload_len, .. } => *payload_len,
+        BinaryEventHeader::Frame { payload_len, .. }
+        | BinaryEventHeader::Cursor { payload_len, .. }
+        | BinaryEventHeader::ClipboardData { payload_len, .. }
+        | BinaryEventHeader::PlaybackData { payload_len, .. }
+        | BinaryEventHeader::PortData { payload_len, .. } => *payload_len,
     };
     let payload = read_payload(reader, payload_len)?;
     Ok(Some(match header {
-        BinaryEventHeader::FrameBinary {
+        BinaryEventHeader::Frame {
             connection_generation,
             graphics_epoch,
             display_channel_id,
@@ -1152,7 +1155,7 @@ pub fn read_event(reader: &mut impl BufRead) -> Result<Option<HelperEvent>, Help
                 pixels: payload,
             }
         }
-        BinaryEventHeader::CursorBinary {
+        BinaryEventHeader::Cursor {
             connection_generation,
             cursor_epoch,
             channel_id,
@@ -1185,14 +1188,14 @@ pub fn read_event(reader: &mut impl BufRead) -> Result<Option<HelperEvent>, Help
                 rgba: payload,
             }
         }
-        BinaryEventHeader::ClipboardDataBinary {
+        BinaryEventHeader::ClipboardData {
             selection, format, ..
         } => HelperEvent::ClipboardData {
             selection,
             format,
             data: payload,
         },
-        BinaryEventHeader::PlaybackDataBinary {
+        BinaryEventHeader::PlaybackData {
             channel_id,
             stream_generation,
             sequence,
@@ -1221,7 +1224,7 @@ pub fn read_event(reader: &mut impl BufRead) -> Result<Option<HelperEvent>, Help
                 pcm_s16le: payload,
             }
         }
-        BinaryEventHeader::PortDataBinary {
+        BinaryEventHeader::PortData {
             channel_id,
             discontinuity,
             ..
