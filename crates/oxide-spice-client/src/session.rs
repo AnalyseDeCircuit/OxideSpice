@@ -3234,7 +3234,20 @@ mod tests {
             .await;
             let (message_type, key) = read_mini_message(&mut inputs_stream).await;
             assert_eq!(message_type, oxide_spice_protocol::inputs_client::KEY_UP);
-            assert_eq!(key, 0x1E_u32.to_le_bytes());
+            assert_eq!(key, [0x9e, 0, 0, 0]);
+
+            for (press, release) in [
+                ([0x1c, 0, 0, 0], [0x9c, 0, 0, 0]),
+                ([0xe0, 0x48, 0, 0], [0xe0, 0xc8, 0, 0]),
+                ([0xe0, 0x1d, 0, 0], [0xe0, 0x9d, 0, 0]),
+            ] {
+                let (kind, body) = read_mini_message(&mut inputs_stream).await;
+                assert_eq!(kind, oxide_spice_protocol::inputs_client::KEY_DOWN);
+                assert_eq!(body, press);
+                let (kind, body) = read_mini_message(&mut inputs_stream).await;
+                assert_eq!(kind, oxide_spice_protocol::inputs_client::KEY_UP);
+                assert_eq!(body, release);
+            }
 
             write_mini_message(
                 &mut second_display_stream,
@@ -3615,6 +3628,10 @@ mod tests {
             .key_up(0x1E)
             .await
             .expect("send second display trigger");
+        for code in [0x1c, 0xe048, 0xe01d] {
+            inputs.key_down(code).await.expect("press test key");
+            inputs.key_up(code).await.expect("release test key");
+        }
         let topology = topology_events
             .next()
             .await

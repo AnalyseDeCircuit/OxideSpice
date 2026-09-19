@@ -102,22 +102,22 @@ impl InputsHandle {
         self.raw_scancodes_supported
     }
 
-    /// Waits for bounded queue capacity and sends one legacy key-down code.
+    /// Sends a set-1 make code (for example, `0x1c` or extended `0xe01c`).
     pub async fn key_down(&self, code: u32) -> Result<(), InputSendError> {
         self.send_edge(InputEdge::KeyDown(code)).await
     }
 
-    /// Sends one legacy key-down code without waiting for queue space.
+    /// Sends the same make-code format as `key_down` without waiting for queue space.
     pub fn try_key_down(&self, code: u32) -> Result<(), InputSendError> {
         self.try_edge(InputEdge::KeyDown(code))
     }
 
-    /// Waits for bounded queue capacity and sends one legacy key-up code.
+    /// Releases a key using the same make code passed to `key_down`.
     pub async fn key_up(&self, code: u32) -> Result<(), InputSendError> {
         self.send_edge(InputEdge::KeyUp(code)).await
     }
 
-    /// Sends one legacy key-up code without waiting for queue space.
+    /// Releases a make code without waiting for queue space.
     pub fn try_key_up(&self, code: u32) -> Result<(), InputSendError> {
         self.try_edge(InputEdge::KeyUp(code))
     }
@@ -569,12 +569,12 @@ where
     match edge {
         InputEdge::KeyDown(code) => {
             channel
-                .write_message(inputs_client::KEY_DOWN, &encode_key_code(code))
+                .write_message(inputs_client::KEY_DOWN, &encode_key_edge(code, false))
                 .await
         }
         InputEdge::KeyUp(code) => {
             channel
-                .write_message(inputs_client::KEY_UP, &encode_key_code(code))
+                .write_message(inputs_client::KEY_UP, &encode_key_edge(code, true))
                 .await
         }
         InputEdge::Scancodes(bytes) => {
@@ -606,6 +606,17 @@ where
                 )
                 .await
         }
+    }
+}
+
+fn encode_key_edge(code: u32, released: bool) -> [u8; 4] {
+    // KEY_UP still carries a set-1 break code. Extended prefixes must precede
+    // the key byte on the wire, independently of the integer's byte order.
+    let code = code | if released { 0x80 } else { 0 };
+    if code & 0xff00 == 0xe000 {
+        [0xe0, code as u8, 0, 0]
+    } else {
+        encode_key_code(code)
     }
 }
 

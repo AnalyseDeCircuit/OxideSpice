@@ -185,7 +185,30 @@ pub(crate) async fn run_helper(
     let mut resources = take_session_resources(session);
     let drive_result = drive_session(&mut resources, &mut requests, &events).await;
     let shutdown_result = shutdown_session(resources, &events).await;
-    drive_result.and(shutdown_result)
+    let result = session_result(drive_result, shutdown_result);
+    if let Err(error) = &result {
+        send_runtime_error(&events, error)?;
+        events.send_control(HelperEvent::Status {
+            status: HelperStatus::Failed,
+            message: Some(error.to_string()),
+        })?;
+    }
+    result
+}
+
+fn session_result(
+    drive: Result<(), HelperRuntimeError>,
+    shutdown: Result<(), HelperRuntimeError>,
+) -> Result<(), HelperRuntimeError> {
+    // Watch receivers may close before the supervisor delivers the actual failure.
+    // Prefer that failure over the resulting host API channel-closed error.
+    match (drive, shutdown) {
+        (Err(HelperRuntimeError::HostApi(_)), Err(error @ HelperRuntimeError::Client(_))) => {
+            Err(error)
+        }
+        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 async fn drive_session(
@@ -358,11 +381,9 @@ async fn shutdown_session(
     while resources.background_tasks.join_next().await.is_some() {}
     if let Err(error) = resources.session.shutdown().await
         && error.category() != ErrorCategory::Cancelled
+        && first_error.is_none()
     {
-        let _ = send_client_error(events, &error);
-        if first_error.is_none() {
-            first_error = Some(HelperRuntimeError::Client(error));
-        }
+        first_error = Some(HelperRuntimeError::Client(error));
     }
     if let Err(error) = events.send_control(HelperEvent::Status {
         status: HelperStatus::Disconnected,
@@ -2117,6 +2138,35 @@ fn agent_error(error: AgentSendError) -> String {
 #[cfg(test)]
 mod native_inventory_tests {
     use super::*;
+
+    #[test]
+    fn session_failure_preserves_protocol_cause_over_closed_agent_receiver() {
+        let result = session_result(
+            Err(HelperRuntimeError::HostApi(
+                "Agent channel is closed".to_owned(),
+            )),
+            Err(HelperRuntimeError::Client(
+                ClientError::UnsupportedMessage {
+                    channel: "main",
+                    message_type: 999,
+                },
+            )),
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "SPICE client failed: unsupported stateful SPICE message 999 on main"
+        );
+        let result = session_result(
+            Err(HelperRuntimeError::Configuration(
+                "invalid action".to_owned(),
+            )),
+            Ok(()),
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "helper configuration is invalid: invalid action"
+        );
+    }
 
     #[test]
     fn cursor_payload_is_reused_only_within_the_same_identity() {

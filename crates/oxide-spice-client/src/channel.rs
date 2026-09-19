@@ -854,6 +854,21 @@ impl ControlState {
                     reason: read_u32(message.body, 8),
                 });
             }
+            common_server::NOTIFY => {
+                // Notifications carry no channel state transition. Validate the bounded
+                // string without retaining or logging arbitrary server-provided text.
+                if message.body.len() < 25 {
+                    return Err(protocol_size_error("notify body"));
+                }
+                let text_len = read_u32(message.body, 20) as usize;
+                if text_len != message.body.len() - 25 {
+                    return Err(protocol_size_error("notify message length"));
+                }
+                if message.body.last() != Some(&0) {
+                    return Err(protocol_value_error("notify message terminator"));
+                }
+                ControlDisposition::Consumed
+            }
             common_server::MIGRATE => {
                 channel.migrate_to_replacement(message.body).await?;
                 self.generation = 0;
@@ -1372,6 +1387,61 @@ mod tests {
             .await
             .expect_err("self wait cannot make progress");
         assert_eq!(error.category(), crate::ErrorCategory::Protocol);
+    }
+
+    #[tokio::test]
+    async fn server_notify_is_consumed_and_acknowledged_without_ending_channel() {
+        let (stream, mut peer) = duplex(1024);
+        let mut channel = test_channel(stream);
+        let mut control = ControlState::new();
+        control.window = 1;
+        let mut body = vec![0; 24];
+        body[20..24].copy_from_slice(&4_u32.to_le_bytes());
+        body.extend_from_slice(b"test\0");
+        let message = IncomingMessage {
+            header: DataHeader {
+                serial: Some(1),
+                message_type: common_server::NOTIFY,
+                body_size: body.len() as u32,
+                sub_list_offset: None,
+            },
+            body: &body,
+        };
+        assert_eq!(
+            control.handle(&mut channel, &message).await.unwrap(),
+            ControlDisposition::Consumed
+        );
+        let mut ack = [0; 6];
+        peer.read_exact(&mut ack).await.unwrap();
+        assert_eq!(ack, [2, 0, 0, 0, 0, 0]);
+
+        for invalid in [
+            vec![0; 24],
+            {
+                let mut invalid = body.clone();
+                invalid[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+                invalid
+            },
+            {
+                let mut invalid = body;
+                *invalid.last_mut().unwrap() = 1;
+                invalid
+            },
+        ] {
+            let message = IncomingMessage {
+                header: DataHeader {
+                    serial: Some(2),
+                    message_type: common_server::NOTIFY,
+                    body_size: invalid.len() as u32,
+                    sub_list_offset: None,
+                },
+                body: &invalid,
+            };
+            assert!(matches!(
+                control.handle(&mut channel, &message).await,
+                Err(ClientError::Decode(_))
+            ));
+        }
     }
 
     fn test_channel(stream: tokio::io::DuplexStream) -> Channel<tokio::io::DuplexStream> {
