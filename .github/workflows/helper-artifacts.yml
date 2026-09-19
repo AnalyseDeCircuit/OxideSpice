@@ -195,6 +195,8 @@ jobs:
             echo "NATIVE_PREFIX=${RUNNER_TEMP}/oxide-spice-native-prefix"
             echo "PKG_CONFIG_PATH=${RUNNER_TEMP}/oxide-spice-native-prefix/lib/pkgconfig;${RUNNER_TEMP}/oxide-spice-native-prefix/share/pkgconfig"
             echo "VCPKG_ROOT=${RUNNER_TEMP}/oxide-spice-disabled-vcpkg"
+            # Native ARM64 builds must not inherit the installed Clang's default target.
+            echo "BINDGEN_EXTRA_CLANG_ARGS=--target=${{ matrix.target }}"
             # env-libvpx-sys does not propagate the MSVC archive to final links.
             echo "RUSTFLAGS=-C target-feature=+crt-static -C link-arg=${RUNNER_TEMP}/oxide-spice-native-prefix/lib/libvpx.lib"
             echo "VPX_LIB_DIR=${RUNNER_TEMP}/oxide-spice-native-prefix/lib"
