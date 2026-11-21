@@ -29,7 +29,8 @@ def archive_name(source: dict) -> str:
 def msvc_toolset_args(environment: dict[str, str]) -> list[str]:
     # The pinned libusb and libvpx projects predate VS 2026. Use its active toolset
     # instead of libusb's empty default or the v143 selected by libvpx's generator.
-    return ["/p:PlatformToolset=v145"] if environment.get("VisualStudioVersion") == "18.0" else []
+    # Windows os.environ.copy() stores environment variable names in uppercase.
+    return ["/p:PlatformToolset=v145"] if environment.get("VISUALSTUDIOVERSION") == "18.0" else []
 
 
 def extract_archive(archive: Path, destination: Path) -> Path:
