@@ -15,7 +15,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # vpx-rs 0.2.1 does not support the libvpx 1.16 headers on Ubuntu 26.04.
+        os: [ubuntu-24.04, macos-latest]
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

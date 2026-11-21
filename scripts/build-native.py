@@ -26,6 +26,12 @@ def archive_name(source: dict) -> str:
     return f"{source['name']}-{source['version']}{suffix}"
 
 
+def msvc_toolset_args(environment: dict[str, str]) -> list[str]:
+    # The pinned libusb and libvpx projects predate VS 2026. Use its active toolset
+    # instead of libusb's empty default or the v143 selected by libvpx's generator.
+    return ["/p:PlatformToolset=v145"] if environment.get("VisualStudioVersion") == "18.0" else []
+
+
 def extract_archive(archive: Path, destination: Path) -> Path:
     destination.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive) as source:
@@ -183,6 +189,7 @@ def build_libusb(
                 "/m",
                 "/p:Configuration=Release-MT",
                 f"/p:Platform={visual_studio_platform}",
+                *msvc_toolset_args(libusb_environment),
             ],
             environment=libusb_environment,
         )
@@ -276,6 +283,7 @@ def build_libvpx(source: Path, build: Path, prefix: Path, platform: str, archite
                 "/t:Build",
                 "/p:Configuration=Release",
                 f"/p:Platform={visual_studio_platform}",
+                *msvc_toolset_args(libvpx_environment),
             ],
             cwd=build,
             environment=libvpx_environment,
